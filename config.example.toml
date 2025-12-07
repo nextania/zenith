@@ -1,0 +1,10 @@
+[dns_providers.cloudflare]
+api_key = ""
+
+[[certificates]]
+name = "example-com"
+domains = ["example.com", "*.example.com"]
+acme_provider = "letsencrypt-staging"
+dns_provider = "cloudflare"
+account_email = "admin@example.com"
+output_dir = "./certs/example-com"
