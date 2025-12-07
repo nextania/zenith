@@ -1,6 +1,7 @@
 mod acme;
 mod cloudflare;
 mod config;
+mod dns_provider;
 
 use acme::AcmeService;
 use cloudflare::CloudflareClient;

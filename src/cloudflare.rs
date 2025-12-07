@@ -1,4 +1,6 @@
+use crate::dns_provider::DnsProvider;
 use anyhow::{anyhow, Result};
+use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -148,5 +150,25 @@ impl CloudflareClient {
 
         debug!("Successfully deleted TXT record");
         Ok(())
+    }
+}
+
+#[async_trait]
+impl DnsProvider for CloudflareClient {
+    async fn create_txt_record(
+        &self,
+        domain: &str,
+        record_name: &str,
+        content: &str,
+    ) -> Result<String> {
+        self.create_txt_record(domain, record_name, content).await
+    }
+
+    async fn delete_txt_record(&self, domain: &str, record_id: &str) -> Result<()> {
+        self.delete_txt_record(domain, record_id).await
+    }
+
+    fn provider_name(&self) -> &str {
+        "Cloudflare"
     }
 }

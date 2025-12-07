@@ -1,4 +1,4 @@
-use crate::cloudflare::CloudflareClient;
+use crate::dns_provider::DnsProvider;
 use anyhow::{anyhow, Result};
 use instant_acme::{
     Account, AccountCredentials, ChallengeType, Identifier, LetsEncrypt, NewAccount, NewOrder,
@@ -6,13 +6,14 @@ use instant_acme::{
 };
 use rcgen::{CertificateParams, KeyPair};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs;
 use tracing::{debug, info};
 use x509_parser::pem::parse_x509_pem;
 
 pub struct AcmeService {
-    cloudflare: CloudflareClient,
+    dns_provider: Arc<dyn DnsProvider>,
     account_email: String,
     use_production: bool,
 }
@@ -25,12 +26,12 @@ pub struct CertificateResult {
 
 impl AcmeService {
     pub fn new(
-        cloudflare: CloudflareClient,
+        dns_provider: Arc<dyn DnsProvider>,
         account_email: String,
         use_production: bool,
     ) -> Self {
         Self {
-            cloudflare,
+            dns_provider,
             account_email,
             use_production,
         }
@@ -115,7 +116,7 @@ impl AcmeService {
             let record_name = format!("_acme-challenge.{}", domain);
             let key_authorization = order.key_authorization(challenge).dns_value();
             let record_id = self
-                .cloudflare
+                .dns_provider
                 .create_txt_record(&base_domain, &record_name, &key_authorization)
                 .await?;
 
@@ -133,7 +134,7 @@ impl AcmeService {
                         break;
                     }
                     OrderStatus::Invalid => {
-                        self.cloudflare
+                        self.dns_provider
                             .delete_txt_record(&base_domain, &record_id)
                             .await
                             .ok();
@@ -142,7 +143,7 @@ impl AcmeService {
                     OrderStatus::Pending | OrderStatus::Processing => {
                         attempts += 1;
                         if attempts > 30 {
-                            self.cloudflare
+                            self.dns_provider
                                 .delete_txt_record(&base_domain, &record_id)
                                 .await
                                 .ok();
@@ -151,7 +152,7 @@ impl AcmeService {
                     }
                 }
             }
-            self.cloudflare
+            self.dns_provider
                 .delete_txt_record(&base_domain, &record_id)
                 .await?;
         }
