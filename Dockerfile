@@ -7,5 +7,6 @@ RUN cargo install --path . --locked
  
 FROM debian:trixie-slim
 WORKDIR /usr/app
+RUN apt update && apt install -y ca-certificates
 COPY --from=builder /usr/local/cargo/bin/zenith ./
 CMD ["./zenith"]
