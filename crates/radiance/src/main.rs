@@ -5,13 +5,45 @@ pub mod environment;
 pub mod vault;
 
 use log::info;
-use pingora::prelude::*;
+use pingora::{listeners::tls::TlsSettings, prelude::*, services::listening::Service, tls::ResolvesServerCert};
+use pingora_proxy::HttpProxy;
+use pingora_rustls::ServerConfig;
+use rustls::{sign::CertifiedKey, version};
 use std::{env, sync::Arc, thread};
 use tokio::sync::RwLock;
 use proxy::RadianceProxy;
 use control_socket::ControlSocket;
 
-use crate::config::FullConfig;
+use crate::{config::FullConfig, environment::CONFIG_FILE, proxy::normalize_match_domain};
+
+#[derive(Debug)]
+struct CertifiateWrapper {
+    cert: Arc<CertifiedKey>,
+}
+
+impl ResolvesServerCert for CertifiateWrapper {
+    fn resolve(&self, _client_hello: rustls::server::ClientHello) -> std::option::Option<Arc<CertifiedKey>> {
+        Some(self.cert.clone())
+    }
+}
+
+async fn get_cert_for_sni(
+    sni: &str,
+    config: Arc<RwLock<FullConfig>>,
+) -> Option<CertifiedKey> {
+    let config = config.read().await;
+    let id = config.hosts.values().find_map(|host_cfg| {
+        if host_cfg.config.domains.iter().any(|d| normalize_match_domain(sni, d)) {
+            Some(host_cfg.config.tls_cert_id.clone())
+        } else {
+            None
+        }
+    }).flatten().map(|s| config.certificates.iter().find(|c| c.config.id == s)).flatten();
+    match id {
+        Some(cert_cfg) => Some(cert_cfg.cert.clone()),
+        None => None,
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -20,16 +52,16 @@ async fn main() {
     rustls::crypto::ring::default_provider().install_default().ok();
     info!("Starting Radiance reverse proxy");
 
-    let config_path = env::var("CONFIG_FILE").unwrap_or_else(|_| "radiance.toml".to_string());
-    if !std::path::Path::new(&config_path).exists() {
-        panic!("Configuration file not found at path: {}", config_path);
+    if !std::path::Path::new(&*CONFIG_FILE).exists() {
+        panic!("Configuration file not found at path: {}", &*CONFIG_FILE);
     }
-    let config = FullConfig::load_from_file(&config_path)
+    let config = FullConfig::load_from_file(&CONFIG_FILE)
         .await
         .expect("Failed to load configuration");
     info!("Configuration loaded");
 
     let listen_address = config.listen_address();
+    let listen_address_tls = config.listen_address_tls();
     let shared_config = Arc::new(RwLock::new(config));
 
     let control_socket_path = std::env::var("CONTROL_SOCKET_PATH")
@@ -43,11 +75,27 @@ async fn main() {
 
     let mut proxy = Server::new(Some(Opt::default())).unwrap();
     proxy.bootstrap();
-    let mut proxy_service_http = pingora_proxy::http_proxy_service(
-        &proxy.configuration,
-        RadianceProxy::new(shared_config.clone()),
-    );
+    let mut proxy_service_http = pingora_proxy::http_proxy_service_with_name(&proxy.configuration, RadianceProxy::new(shared_config.clone()), "Radiance");
+
     proxy_service_http.add_tcp(&listen_address);
+    if let Some(tls_address) = listen_address_tls {
+        proxy_service_http.add_tls_with_settings(&tls_address, None, TlsSettings::with_async_callback(
+            Arc::new(move |x| {
+                let config = shared_config.clone();
+                let info = x.sni.as_deref().unwrap_or_default().to_string();
+                Box::pin(async move {
+                    let cert = get_cert_for_sni(&info, config).await;
+                    let resolver = CertifiateWrapper {
+                        cert: Arc::new(cert.ok_or(pingora::Error::new_in(ErrorType::InvalidCert))?),
+                    };
+                    let config = ServerConfig::builder_with_protocol_versions(&[&version::TLS12, &version::TLS13])
+                        .with_no_client_auth()
+                        .with_cert_resolver(Arc::new(resolver));
+                    Ok(Arc::new(config))
+                })
+            })
+        ).expect("Failed to create TLS settings"));
+    }
     proxy.add_service(proxy_service_http);
     
     info!("Radiance proxy server starting...");
