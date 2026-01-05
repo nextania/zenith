@@ -86,7 +86,7 @@ impl ProxyHttp for RadianceProxy {
         let host_config = config.hosts.iter().find(|h| {
             h.1.config.enabled && h.1.config.domains.iter().any(|d| normalize_match_domain(d, &host))
         }).map(|host_config| host_config.1)
-            .ok_or(pingora::Error::new_down(ErrorType::InvalidHTTPHeader))?;
+            .ok_or(pingora::Error::new_down(ErrorType::HTTPStatus(404)))?;
         ctx.host_config = Some(host_config.clone());
         ctx.normalized_host = host;
         if let Some(true) = host_config.config.upgrade_https {
