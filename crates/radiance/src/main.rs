@@ -38,7 +38,7 @@ async fn get_cert_for_sni(
         } else {
             None
         }
-    }).flatten().map(|s| config.certificates.iter().find(|c| c.config.id == s)).flatten();
+    }).flatten().map(|s| config.certificates.iter().find(|c| c.config.id() == s)).flatten();
     match id {
         Some(cert_cfg) => Some(cert_cfg.cert.clone()),
         None => None,
