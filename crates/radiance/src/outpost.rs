@@ -3,12 +3,17 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 use anyhow::Context;
 use dashmap::DashMap;
 use lazy_static::lazy_static;
-use tracing::{debug, error, info, warn};
-use tokio::sync::{mpsc::UnboundedSender, oneshot};
-use quinn::{ServerConfig, Endpoint, Connection, RecvStream, SendStream};
+use quinn::{Connection, Endpoint, RecvStream, SendStream, ServerConfig};
 use rand::RngCore;
+use tokio::sync::{mpsc::UnboundedSender, oneshot};
+use tracing::{debug, error, info, warn};
 
-use crate::{config::OutpostConfig, protocol::{ArchivedDatagramMessage, ArchivedProtocolC2S, ArchivedStreamC2S, ProtocolS2C, StreamS2C}};
+use crate::{
+    config::OutpostConfig,
+    protocol::{
+        ArchivedDatagramMessage, ArchivedProtocolC2S, ArchivedStreamC2S, ProtocolS2C, StreamS2C,
+    },
+};
 
 lazy_static! {
     // TODO: cleanup on disconnect
@@ -53,7 +58,6 @@ pub enum OutpostResponse {
 }
 
 pub async fn request(outpost_id: String, body: OutpostRequest) -> anyhow::Result<OutpostResponse> {
-    
     let outpost = ACTIVE_OUTPOSTS.get(&outpost_id);
     if outpost.is_none() {
         error!("Outpost {} not connected", outpost_id);
@@ -61,40 +65,47 @@ pub async fn request(outpost_id: String, body: OutpostRequest) -> anyhow::Result
     }
     // gen new req id;
     let req = match body {
-        OutpostRequest::SignalFwdAdd { host, port} => {
-            ProtocolS2C::SignalFwdAdd { host, port, req: rand::rng().next_u64() }
-        }
-        OutpostRequest::Dns { host } => {
-            ProtocolS2C::Dns { host, req: rand::rng().next_u64() }
-        }
-        OutpostRequest::SignalFwdRemove { host, port } => {
-            ProtocolS2C::SignalFwdRemove { host, port, req: rand::rng().next_u64() }
-        }
-        OutpostRequest::SignalFwdList => {
-            ProtocolS2C::SignalFwdList { req: rand::rng().next_u64() }
-        }
-        OutpostRequest::Tcp { data, id } => {
-            ProtocolS2C::Tcp { data, id }
-        }
-        OutpostRequest::TcpConnect { destination_host, destination_port, id } => {
-            ProtocolS2C::TcpConnect { destination_host, destination_port, id }
-        }
-        OutpostRequest::TcpDisconnect { id } => {
-            ProtocolS2C::TcpDisconnect { id }
-        }
+        OutpostRequest::SignalFwdAdd { host, port } => ProtocolS2C::SignalFwdAdd {
+            host,
+            port,
+            req: rand::rng().next_u64(),
+        },
+        OutpostRequest::Dns { host } => ProtocolS2C::Dns {
+            host,
+            req: rand::rng().next_u64(),
+        },
+        OutpostRequest::SignalFwdRemove { host, port } => ProtocolS2C::SignalFwdRemove {
+            host,
+            port,
+            req: rand::rng().next_u64(),
+        },
+        OutpostRequest::SignalFwdList => ProtocolS2C::SignalFwdList {
+            req: rand::rng().next_u64(),
+        },
+        OutpostRequest::Tcp { data, id } => ProtocolS2C::Tcp { data, id },
+        OutpostRequest::TcpConnect {
+            destination_host,
+            destination_port,
+            id,
+        } => ProtocolS2C::TcpConnect {
+            destination_host,
+            destination_port,
+            id,
+        },
+        OutpostRequest::TcpDisconnect { id } => ProtocolS2C::TcpDisconnect { id },
     };
 
     match req {
-        ProtocolS2C::SignalFwdAdd { req: req_id, .. } |
-        ProtocolS2C::Dns { req: req_id, .. } |
-        ProtocolS2C::SignalFwdRemove { req: req_id, .. } |
-        ProtocolS2C::SignalFwdList { req: req_id, .. } |
-        ProtocolS2C::TcpConnect { id: req_id , .. } => {
+        ProtocolS2C::SignalFwdAdd { req: req_id, .. }
+        | ProtocolS2C::Dns { req: req_id, .. }
+        | ProtocolS2C::SignalFwdRemove { req: req_id, .. }
+        | ProtocolS2C::SignalFwdList { req: req_id, .. }
+        | ProtocolS2C::TcpConnect { id: req_id, .. } => {
             let (tx, rx) = oneshot::channel();
             ACTIVE_REQUESTS.insert(req_id, tx);
             let outpost = outpost.unwrap();
             outpost.send(req).context("Failed to send OutpostRequest")?;
-        
+
             match rx.await {
                 Ok(response) => Ok(response),
                 Err(e) => {
@@ -116,10 +127,8 @@ pub fn make_config() -> anyhow::Result<ServerConfig> {
     let cert_path = "certs/internal-dns.crt";
     let key_path = "certs/internal-dns.key";
 
-    let cert_data = std::fs::read(cert_path)
-        .context("Failed to read certificate file")?;
-    let key_data = std::fs::read(key_path)
-        .context("Failed to read private key file")?;
+    let cert_data = std::fs::read(cert_path).context("Failed to read certificate file")?;
+    let key_data = std::fs::read(key_path).context("Failed to read private key file")?;
 
     let cert_chain = rustls_pemfile::certs(&mut &cert_data[..])
         .collect::<Result<Vec<_>, _>>()
@@ -138,7 +147,7 @@ pub fn make_config() -> anyhow::Result<ServerConfig> {
 
     let mut server_config = ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(crypto)
-            .context("Failed to create QUIC server config")?
+            .context("Failed to create QUIC server config")?,
     ));
 
     let mut transport_config = quinn::TransportConfig::default();
@@ -202,7 +211,10 @@ fn handle_protocol_message(msg: &ArchivedProtocolC2S) {
             if let Some((_, sender)) = ACTIVE_REQUESTS.remove(&req_id) {
                 let _ = sender.send(OutpostResponse::Ack);
             } else {
-                warn!("Received SignalFwdRemove for unknown request id: {}", req_id);
+                warn!(
+                    "Received SignalFwdRemove for unknown request id: {}",
+                    req_id
+                );
             }
         }
         ArchivedProtocolC2S::SignalFwdList { entries, req } => {
@@ -328,21 +340,21 @@ async fn handle_incoming_stream(
     streams_tx: tokio::sync::mpsc::UnboundedSender<ProtocolS2C>,
 ) -> anyhow::Result<()> {
     let mut buffer = Vec::new();
-    
+
     loop {
         let mut chunk = [0u8; 8192];
         match recv.read(&mut chunk).await {
             Ok(Some(len)) => {
                 buffer.extend_from_slice(&chunk[..len]);
-                
+
                 while buffer.len() >= 2 {
                     let msg_len = u16::from_be_bytes([buffer[0], buffer[1]]) as usize;
                     if buffer.len() < msg_len + 2 {
                         break;
                     }
-                    
+
                     let msg_data: Vec<u8> = buffer.drain(0..msg_len + 2).skip(2).collect();
-                    
+
                     match rkyv::access::<ArchivedStreamC2S, rkyv::rancor::Error>(&msg_data) {
                         Ok(data) => {
                             let cid = data.cid.to_native();
@@ -351,12 +363,12 @@ async fn handle_incoming_stream(
                                 let should_register = identity_guard.is_none();
                                 *identity_guard = Some(outpost.clone());
                                 drop(identity_guard);
-                                
+
                                 if should_register {
                                     ACTIVE_OUTPOSTS.insert(outpost.0.clone(), streams_tx.clone());
                                     info!("Outpost {} registered", outpost.0);
                                 }
-                                
+
                                 debug!("Received message: {:?}", data.msg);
                                 handle_protocol_message(&data.msg);
                             } else {
@@ -379,7 +391,7 @@ async fn handle_incoming_stream(
             }
         }
     }
-    
+
     Ok(())
 }
 
@@ -420,7 +432,7 @@ async fn send_message(
         cid: u128::from_str_radix(shared_secret, 16).unwrap(),
         msg,
     };
-    
+
     let serialized = rkyv::to_bytes::<rkyv::rancor::Error>(&data).unwrap();
     let mut send_buf = Vec::with_capacity(2 + serialized.len());
     let len_bytes = (serialized.len() as u16).to_be_bytes();
@@ -429,34 +441,44 @@ async fn send_message(
 
     if let Some(id) = tcp_id {
         if !tcp_stream_map.contains_key(&id) {
-            let (send, _recv) = connection.open_bi().await
+            let (send, _recv) = connection
+                .open_bi()
+                .await
                 .context("Failed to open bi-directional stream")?;
             tcp_stream_map.insert(id, send);
         }
-        
+
         if let Some(stream) = tcp_stream_map.get_mut(&id) {
-            stream.write_all(&send_buf).await
+            stream
+                .write_all(&send_buf)
+                .await
                 .context("Failed to write to stream")?;
-            
+
             if matches!(data.msg, ProtocolS2C::TcpDisconnect { .. }) {
                 let _ = stream.finish();
                 tcp_stream_map.remove(&id);
             }
         }
     } else {
-        let (mut send, _recv) = connection.open_bi().await
+        let (mut send, _recv) = connection
+            .open_bi()
+            .await
             .context("Failed to open bi-directional stream")?;
-        send.write_all(&send_buf).await
+        send.write_all(&send_buf)
+            .await
             .context("Failed to write to stream")?;
     }
 
     Ok(())
 }
 
-pub async fn initialize_outposts(local_addr: SocketAddr, outposts: HashMap<String, OutpostConfig>) -> anyhow::Result<()> {
+pub async fn initialize_outposts(
+    local_addr: SocketAddr,
+    outposts: HashMap<String, OutpostConfig>,
+) -> anyhow::Result<()> {
     let server_config = make_config()?;
     let endpoint = Endpoint::server(server_config, local_addr)?;
-    
+
     info!("Outpost listener bound on {}", local_addr);
 
     loop {
@@ -485,4 +507,3 @@ pub async fn initialize_outposts(local_addr: SocketAddr, outposts: HashMap<Strin
 
     Ok(())
 }
-

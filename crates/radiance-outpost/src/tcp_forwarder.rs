@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, error, info};
 
 pub struct TcpOutgoingData {
@@ -47,18 +47,21 @@ impl TcpForwarder {
             event_rx: Arc::new(Mutex::new(event_rx)),
         }
     }
-    
+
     pub fn connect(&self, id: u64, destination_host: &str, destination_port: u16) {
         let outgoing_tx = self.outgoing_tx.clone();
         let event_tx = self.event_tx.clone();
         let connections = self.connections.clone();
         let destination_host = destination_host.to_string();
-        tokio::spawn(async move {            
+        tokio::spawn(async move {
             if connections.contains_key(&id) {
                 info!("TCP connection {} already exists", id);
                 return;
             }
-            info!("Creating new TCP connection {} to {}:{}", id, destination_host, destination_port);
+            info!(
+                "Creating new TCP connection {} to {}:{}",
+                id, destination_host, destination_port
+            );
             let target_addr = format!("{}:{}", destination_host, destination_port);
             match TcpStream::connect(&target_addr).await {
                 Ok(stream) => {
@@ -81,7 +84,9 @@ impl TcpForwarder {
                             dest_host,
                             destination_port,
                             outgoing_tx_clone,
-                        ).await {
+                        )
+                        .await
+                        {
                             debug!("TCP connection {} read error: {}", id, e);
                         }
 
@@ -93,13 +98,16 @@ impl TcpForwarder {
                     let _ = event_tx.send(TcpEvent::Connected { id });
                 }
                 Err(e) => {
-                    error!("Failed to connect to {}:{}: {}", destination_host, destination_port, e);
+                    error!(
+                        "Failed to connect to {}:{}: {}",
+                        destination_host, destination_port, e
+                    );
                     return;
                 }
             }
         });
     }
-    
+
     pub fn send_data(&self, id: u64, data: &[u8]) {
         let connections = self.connections.clone();
         let data = data.to_vec();
@@ -111,14 +119,18 @@ impl TcpForwarder {
                     error!("Failed to write to TCP connection {}: {}", id, e);
                     connections.remove(&id);
                 } else {
-                    debug!("TCP connection {} forwarded {} bytes to destination", id, data.len());
+                    debug!(
+                        "TCP connection {} forwarded {} bytes to destination",
+                        id,
+                        data.len()
+                    );
                 }
             } else {
                 error!("TCP connection {} not found for sending data", id);
             }
         });
     }
-    
+
     pub fn disconnect(&self, id: u64) {
         let connections = self.connections.clone();
         tokio::spawn(async move {
@@ -128,15 +140,15 @@ impl TcpForwarder {
             }
         });
     }
-    
+
     pub fn flush(&self) -> Option<TcpOutgoingData> {
         self.outgoing_rx.try_lock().ok()?.try_recv().ok()
     }
-    
+
     pub fn flush_events(&self) -> Option<TcpEvent> {
         self.event_rx.try_lock().ok()?.try_recv().ok()
     }
-    
+
     async fn read_from_connection(
         id: u64,
         mut read_half: OwnedReadHalf,

@@ -40,20 +40,27 @@ async fn main() -> Result<()> {
         .init();
 
     info!("Starting Radiance Outpost");
-    rustls::crypto::ring::default_provider().install_default().ok();
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
     let config = Config::from_file(&args.config).context("Failed to load configuration")?;
     config.validate().context("Invalid configuration")?;
 
-    info!("Configuration loaded: {} ports exposed", config.exposed_ports.len());
+    info!(
+        "Configuration loaded: {} ports exposed",
+        config.exposed_ports.len()
+    );
     for port in &config.exposed_ports {
         info!(
             "  - {:?} port {} -> {}",
             port.protocol,
             port.port,
-            port.local_addr.as_ref().unwrap_or(&format!("127.0.0.1:{}", port.port))
+            port.local_addr
+                .as_ref()
+                .unwrap_or(&format!("127.0.0.1:{}", port.port))
         );
     }
-    
+
     let tunnel_task = tokio::spawn(async move {
         // TODO: persist tunnel sessions
         loop {

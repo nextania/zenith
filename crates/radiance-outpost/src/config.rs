@@ -30,7 +30,7 @@ impl Config {
         let contents = std::fs::read_to_string(path).context("Failed to read config file")?;
         toml::from_str(&contents).context("Failed to parse TOML config")
     }
-    
+
     pub fn validate(&self) -> Result<()> {
         if self.exposed_ports.is_empty() {
             anyhow::bail!("No ports configured to expose");

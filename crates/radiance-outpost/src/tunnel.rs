@@ -1,17 +1,17 @@
 use anyhow::{Context, Result};
+use quinn::{ClientConfig, Connection, Endpoint, RecvStream, SendStream};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
-use quinn::{ClientConfig, Endpoint, Connection, RecvStream, SendStream};
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 
 use crate::tcp_forwarder::TcpEvent;
 use crate::{
     protocol::{
-        ArchivedDatagramMessage, ArchivedProtocolS2C, ArchivedStreamS2C,
-        DatagramMessage, ProtocolC2S, StreamC2S,
+        ArchivedDatagramMessage, ArchivedProtocolS2C, ArchivedStreamS2C, DatagramMessage,
+        ProtocolC2S, StreamC2S,
     },
     tcp_forwarder::TcpForwarder,
     udp_forwarder::UdpForwarder,
@@ -87,7 +87,7 @@ impl Tunnel {
         crypto.alpn_protocols = vec![b"radiance-outpost".to_vec()];
         let mut client_config = ClientConfig::new(Arc::new(
             quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
-                .context("Failed to create QUIC crypto config")?
+                .context("Failed to create QUIC crypto config")?,
         ));
         let mut transport_config = quinn::TransportConfig::default();
         transport_config.max_idle_timeout(Some(Duration::from_secs(60).try_into().unwrap()));
@@ -101,10 +101,13 @@ impl Tunnel {
         transport_config.keep_alive_interval(Some(Duration::from_secs(30).try_into().unwrap()));
         client_config.transport_config(Arc::new(transport_config));
         let bind_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
-        let mut endpoint = Endpoint::client(bind_addr)
-            .context("Failed to create QUIC endpoint")?;
+        let mut endpoint = Endpoint::client(bind_addr).context("Failed to create QUIC endpoint")?;
         endpoint.set_default_client_config(client_config);
-        info!("Tunnel initialized on {} -> {}", endpoint.local_addr()?, server_endpoint);
+        info!(
+            "Tunnel initialized on {} -> {}",
+            endpoint.local_addr()?,
+            server_endpoint
+        );
         let connection = endpoint
             .connect(server_endpoint, "radiance-outpost")
             .context("Failed to initiate connection")?
@@ -122,15 +125,20 @@ impl Tunnel {
         let mut send_buf = Vec::new();
         send_buf.extend_from_slice(&(buf.len() as u16).to_be_bytes());
         send_buf.extend_from_slice(&buf);
-        let (mut send, _recv) = connection.open_bi().await.context("Failed to open stream")?;
-        send.write_all(&send_buf).await.context("Failed to send identify")?;
+        let (mut send, _recv) = connection
+            .open_bi()
+            .await
+            .context("Failed to open stream")?;
+        send.write_all(&send_buf)
+            .await
+            .context("Failed to send identify")?;
         Ok(Self {
             connection,
             tcp_stream_map: HashMap::new(),
             shared_secret: shared_secret_num,
         })
     }
-    
+
     pub async fn run(&mut self, tcp: TcpForwarder, udp: UdpForwarder) -> Result<()> {
         loop {
             tokio::select! {
@@ -187,7 +195,10 @@ impl Tunnel {
                 }
             }
             if self.connection.close_reason().is_some() {
-                warn!("QUIC connection closed: {:?}", self.connection.close_reason());
+                warn!(
+                    "QUIC connection closed: {:?}",
+                    self.connection.close_reason()
+                );
                 return Err(anyhow::anyhow!("QUIC connection closed"));
             }
         }
@@ -239,19 +250,23 @@ impl Tunnel {
         Ok(())
     }
 
-    fn handle_protocol_message(
-        msg: &ArchivedProtocolS2C,
-        tcp: &TcpForwarder,
-        _udp: &UdpForwarder,
-    ) {
+    fn handle_protocol_message(msg: &ArchivedProtocolS2C, tcp: &TcpForwarder, _udp: &UdpForwarder) {
         match msg {
             ArchivedProtocolS2C::Tcp { id, data } => {
                 let tcp_id = id.to_native();
                 tcp.send_data(tcp_id, data.as_slice());
             }
-            ArchivedProtocolS2C::TcpConnect { id, destination_host, destination_port } => {
+            ArchivedProtocolS2C::TcpConnect {
+                id,
+                destination_host,
+                destination_port,
+            } => {
                 let tcp_id = id.to_native();
-                tcp.connect(tcp_id, destination_host.as_str(), destination_port.to_native());
+                tcp.connect(
+                    tcp_id,
+                    destination_host.as_str(),
+                    destination_port.to_native(),
+                );
             }
             ArchivedProtocolS2C::TcpDisconnect { id } => {
                 let tcp_id = id.to_native();
@@ -303,12 +318,17 @@ impl Tunnel {
                     send_buf.extend_from_slice(&(buf.len() as u16).to_be_bytes());
                     send_buf.extend_from_slice(&buf);
                     if !self.tcp_stream_map.contains_key(&id) {
-                        let (send, _recv) = self.connection.open_bi().await
+                        let (send, _recv) = self
+                            .connection
+                            .open_bi()
+                            .await
                             .context("Failed to open bi-directional stream")?;
                         self.tcp_stream_map.insert(id, send);
                     }
                     if let Some(stream) = self.tcp_stream_map.get_mut(&id) {
-                        stream.write_all(&send_buf).await
+                        stream
+                            .write_all(&send_buf)
+                            .await
                             .context("Failed to write TcpConnect message")?;
                     }
                 }
@@ -331,11 +351,14 @@ impl Tunnel {
         }
         Ok(())
     }
-    
+
     async fn send_tcp_data(&mut self, tcp: &TcpForwarder) -> Result<()> {
         while let Some(data) = tcp.flush() {
             if !self.tcp_stream_map.contains_key(&data.id) {
-                let (send, _recv) = self.connection.open_bi().await
+                let (send, _recv) = self
+                    .connection
+                    .open_bi()
+                    .await
                     .context("Failed to open bi-directional stream")?;
                 self.tcp_stream_map.insert(data.id, send);
             }

@@ -1,6 +1,5 @@
 use rkyv::{Archive, Deserialize, Serialize};
 
-
 #[derive(Archive, Deserialize, Serialize, Debug)]
 pub enum ProtocolS2C {
     Tcp {

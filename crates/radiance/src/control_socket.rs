@@ -1,4 +1,3 @@
-use tracing::{error, info};
 use partially::Partial;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -6,9 +5,10 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::RwLock;
+use tracing::{error, info};
 
 use crate::config::{Config, FullConfig, HostConfig, PartialHostConfig};
-use crate::environment::CONFIG_FILE;    
+use crate::environment::CONFIG_FILE;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
@@ -24,8 +24,13 @@ pub enum ControlCommand {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ControlResponse {
-    Success { message: String, data: Option<serde_json::Value> },
-    Error { message: String },
+    Success {
+        message: String,
+        data: Option<serde_json::Value>,
+    },
+    Error {
+        message: String,
+    },
 }
 
 pub type SharedConfig = Arc<RwLock<FullConfig>>;
@@ -76,10 +81,7 @@ impl ControlSocket {
     }
 }
 
-async fn handle_connection(
-    stream: UnixStream,
-    config: SharedConfig,
-) -> anyhow::Result<()> {
+async fn handle_connection(stream: UnixStream, config: SharedConfig) -> anyhow::Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
@@ -108,10 +110,7 @@ async fn handle_connection(
     Ok(())
 }
 
-async fn process_command(
-    command: ControlCommand,
-    config: SharedConfig,
-) -> ControlResponse {
+async fn process_command(command: ControlCommand, config: SharedConfig) -> ControlResponse {
     match command {
         ControlCommand::AddHost { id, host } => add_host(config, id, host).await,
         ControlCommand::UpdateHost { id, host } => update_host(config, id, host).await,
@@ -125,7 +124,11 @@ async fn process_command(
 async fn add_host(config: SharedConfig, id: String, new_host: HostConfig) -> ControlResponse {
     let mut cfg = config.write().await;
     for domain in &new_host.domains {
-        if cfg.hosts.iter().any(|(_, h)| h.config.domains.contains(domain)) {
+        if cfg
+            .hosts
+            .iter()
+            .any(|(_, h)| h.config.domains.contains(domain))
+        {
             return ControlResponse::Error {
                 message: format!("Domain '{}' already exists", domain),
             };
@@ -139,7 +142,10 @@ async fn add_host(config: SharedConfig, id: String, new_host: HostConfig) -> Con
     }
     info!("Added new host with domains: {:?}", new_host.domains);
     ControlResponse::Success {
-        message: format!("Host added successfully with domains: {:?}", new_host.domains),
+        message: format!(
+            "Host added successfully with domains: {:?}",
+            new_host.domains
+        ),
         data: None,
     }
 }
@@ -150,9 +156,7 @@ async fn update_host(
     updated_host: PartialHostConfig,
 ) -> ControlResponse {
     let mut cfg = config.write().await;
-    let host = cfg
-        .hosts
-        .get_mut(&id);
+    let host = cfg.hosts.get_mut(&id);
     match host {
         Some(index) => {
             let mut config = index.config.clone();
@@ -178,9 +182,7 @@ async fn update_host(
 
 async fn remove_host(config: SharedConfig, id: String) -> ControlResponse {
     let mut cfg = config.write().await;
-    let removed_host = cfg
-        .hosts
-        .remove(&id);
+    let removed_host = cfg.hosts.remove(&id);
     match removed_host {
         Some(removed_host) => {
             if let Err(e) = cfg.save_to_file(&CONFIG_FILE).await {
@@ -189,9 +191,15 @@ async fn remove_host(config: SharedConfig, id: String) -> ControlResponse {
                 };
             }
 
-            info!("Removed host with domains: {:?}", removed_host.config.domains);
+            info!(
+                "Removed host with domains: {:?}",
+                removed_host.config.domains
+            );
             ControlResponse::Success {
-                message: format!("Host removed successfully with domains: {:?}", removed_host.config.domains),
+                message: format!(
+                    "Host removed successfully with domains: {:?}",
+                    removed_host.config.domains
+                ),
                 data: None,
             }
         }
@@ -203,7 +211,8 @@ async fn remove_host(config: SharedConfig, id: String) -> ControlResponse {
 
 async fn list_hosts(config: SharedConfig) -> ControlResponse {
     let cfg = config.read().await;
-    let hosts_json = serde_json::to_value::<Config>((&*cfg).into()).unwrap_or(serde_json::Value::Null);
+    let hosts_json =
+        serde_json::to_value::<Config>((&*cfg).into()).unwrap_or(serde_json::Value::Null);
     ControlResponse::Success {
         message: format!("Found {} host(s)", cfg.hosts.len()),
         data: Some(hosts_json),

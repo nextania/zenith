@@ -1,16 +1,28 @@
-
-use std::{collections::{BTreeSet, HashMap}, net::ToSocketAddrs, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashMap},
+    net::ToSocketAddrs,
+    sync::Arc,
+};
 
 use futures_util::FutureExt;
 use http::Extensions;
 use partially::Partial;
-use pingora::{connectors::L4Connect, protocols::l4::{socket::SocketAddr, stream::Stream, virt::{VirtualSocket, VirtualSocketStream}}};
-use pingora_load_balancing::{Backend, Backends, LoadBalancer, discovery::Static, prelude::RoundRobin};
+use pingora::{
+    connectors::L4Connect,
+    protocols::l4::{
+        socket::SocketAddr,
+        stream::Stream,
+        virt::{VirtualSocket, VirtualSocketStream},
+    },
+};
+use pingora_load_balancing::{
+    Backend, Backends, LoadBalancer, discovery::Static, prelude::RoundRobin,
+};
 use rustls::{crypto::ring::sign::any_supported_type, sign::CertifiedKey};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::outpost::{request, OutpostRequest, OutpostResponse, ACTIVE_TCP_STREAMS};
+use crate::outpost::{ACTIVE_TCP_STREAMS, OutpostRequest, OutpostResponse, request};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -29,9 +41,11 @@ pub enum TlsCertConfig {
 impl TlsCertConfig {
     pub fn read_cert(&self) -> anyhow::Result<rustls::sign::CertifiedKey> {
         match self {
-            TlsCertConfig::Local { cert_file, key_file, .. } => {
-                self.read_local_cert(cert_file, key_file)
-            }
+            TlsCertConfig::Local {
+                cert_file,
+                key_file,
+                ..
+            } => self.read_local_cert(cert_file, key_file),
             TlsCertConfig::Vault { .. } => {
                 Err(anyhow::anyhow!("Vault certificate loading not implemented"))
             }
@@ -53,10 +67,7 @@ impl TlsCertConfig {
             "No private keys found in {}",
             key_file_path
         ))?;
-        let certified_key = rustls::sign::CertifiedKey::new(
-            certs,
-            any_supported_type(&key)?,
-        );
+        let certified_key = rustls::sign::CertifiedKey::new(certs, any_supported_type(&key)?);
         Ok(certified_key)
     }
 
@@ -77,24 +88,19 @@ pub struct TlsCertConfigWithKey {
 pub struct UpstreamConfig {
     pub tls: bool,
     pub servers: Vec<ServerConfig>,
-    pub path: String
+    pub path: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ServerConfig {
-    Local {
-        address: String,
-    },
-    Outpost {
-        id: String,
-        address: String,
-    }
+    Local { address: String },
+    Outpost { id: String, address: String },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Partial)]
 #[partially(derive(Default, Debug, Serialize, Deserialize))]
-pub struct HostConfig  {
+pub struct HostConfig {
     pub domains: Vec<String>,
     pub enabled: bool,
     pub tls_cert_id: Option<String>,
@@ -110,7 +116,7 @@ pub struct ForwardAuthConfig {
     pub response_headers: Vec<String>,
 }
 
-#[derive(Clone, Debug,Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Config {
     pub listen_port: u16,
     pub listen_port_tls: Option<u16>,
@@ -120,7 +126,7 @@ pub struct Config {
     pub outposts: Option<HashMap<String, OutpostConfig>>,
 }
 
-#[derive(Clone, Debug,Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct OutpostConfig {
     pub shared_secret: String,
 }
@@ -164,7 +170,10 @@ impl L4Connect for VirtualConnector {
                 pingora::Error::because(
                     pingora::ErrorType::ConnectError,
                     format!("Invalid port: {}", e),
-                    Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid port")),
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "Invalid port",
+                    )),
                 )
             })?;
             (host_part.to_string(), port)
@@ -172,25 +181,37 @@ impl L4Connect for VirtualConnector {
             return Err(pingora::Error::because(
                 pingora::ErrorType::ConnectError,
                 "Invalid address format",
-                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Missing port")),
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Missing port",
+                )),
             ));
         };
         let resolved_host = if host.parse::<std::net::IpAddr>().is_err() {
             match request(
                 self.outpost_id.clone(),
                 OutpostRequest::Dns { host: host.clone() },
-            ).await {
+            )
+            .await
+            {
                 Ok(OutpostResponse::Dns((_, ip))) => ip,
-                Ok(_) => return Err(pingora::Error::because(
-                    pingora::ErrorType::ConnectError,
-                    "Unexpected DNS response",
-                    Box::new(std::io::Error::new(std::io::ErrorKind::Other, "Unexpected response")),
-                )),
-                Err(e) => return Err(pingora::Error::because(
-                    pingora::ErrorType::ConnectError,
-                    format!("DNS resolution failed: {}", e),
-                    Box::new(std::io::Error::new(std::io::ErrorKind::Other, "DNS failed")),
-                )),
+                Ok(_) => {
+                    return Err(pingora::Error::because(
+                        pingora::ErrorType::ConnectError,
+                        "Unexpected DNS response",
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "Unexpected response",
+                        )),
+                    ));
+                }
+                Err(e) => {
+                    return Err(pingora::Error::because(
+                        pingora::ErrorType::ConnectError,
+                        format!("DNS resolution failed: {}", e),
+                        Box::new(std::io::Error::new(std::io::ErrorKind::Other, "DNS failed")),
+                    ));
+                }
             }
         } else {
             host
@@ -203,23 +224,35 @@ impl L4Connect for VirtualConnector {
                 destination_port: port,
                 id: connection_id,
             },
-        ).await {
-            Ok(OutpostResponse::Ack) => {},
-            Ok(_) => return Err(pingora::Error::because(
-                pingora::ErrorType::ConnectError,
-                "Unexpected TcpConnect response",
-                Box::new(std::io::Error::new(std::io::ErrorKind::Other, "Unexpected response")),
-            )),
-            Err(e) => return Err(pingora::Error::because(
-                pingora::ErrorType::ConnectError,
-                format!("TcpConnect failed: {}", e),
-                Box::new(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "Connection failed")),
-            )),
+        )
+        .await
+        {
+            Ok(OutpostResponse::Ack) => {}
+            Ok(_) => {
+                return Err(pingora::Error::because(
+                    pingora::ErrorType::ConnectError,
+                    "Unexpected TcpConnect response",
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "Unexpected response",
+                    )),
+                ));
+            }
+            Err(e) => {
+                return Err(pingora::Error::because(
+                    pingora::ErrorType::ConnectError,
+                    format!("TcpConnect failed: {}", e),
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        "Connection failed",
+                    )),
+                ));
+            }
         }
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         ACTIVE_TCP_STREAMS.insert(connection_id, tx);
         let socket = GenericVirtualSocket::new(rx, self.outpost_id.clone(), connection_id);
-        
+
         Ok(Stream::from(VirtualSocketStream::new(Box::new(socket))))
     }
 }
@@ -232,7 +265,11 @@ pub struct GenericVirtualSocket {
 }
 
 impl GenericVirtualSocket {
-    pub fn new(receiver: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>, outpost_id: String, connection_id: u64) -> Self {
+    pub fn new(
+        receiver: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+        outpost_id: String,
+        connection_id: u64,
+    ) -> Self {
         Self {
             receiver,
             outpost_id,
@@ -242,7 +279,10 @@ impl GenericVirtualSocket {
 }
 
 impl VirtualSocket for GenericVirtualSocket {
-    fn set_socket_option(&self, _: pingora::protocols::l4::virt::VirtualSockOpt) -> std::io::Result<()> {
+    fn set_socket_option(
+        &self,
+        _: pingora::protocols::l4::virt::VirtualSockOpt,
+    ) -> std::io::Result<()> {
         // no-op
         Ok(())
     }
@@ -254,13 +294,13 @@ impl AsyncWrite for GenericVirtualSocket {
         _cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<Result<usize, std::io::Error>> {
-        use crate::outpost::{request, OutpostRequest};
-        
+        use crate::outpost::{OutpostRequest, request};
+
         let outpost_id = self.outpost_id.clone();
         let connection_id = self.connection_id;
         let data = buf.to_vec();
         let len = data.len();
-        
+
         // dispatch data to outpost (non-blocking fire-and-forget)
         tokio::spawn(async move {
             let _ = request(
@@ -269,30 +309,38 @@ impl AsyncWrite for GenericVirtualSocket {
                     data,
                     id: connection_id,
                 },
-            ).await;
+            )
+            .await;
         });
-        
+
         std::task::Poll::Ready(Ok(len))
     }
 
-    fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), std::io::Error>> {
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
         // nothing to flush
         std::task::Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), std::io::Error>> {
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
         let outpost_id = self.outpost_id.clone();
         let connection_id = self.connection_id;
         ACTIVE_TCP_STREAMS.remove(&connection_id);
-        
+
         // dispatch disconnect to outpost (non-blocking fire-and-forget)
         tokio::spawn(async move {
             let _ = request(
                 outpost_id,
                 OutpostRequest::TcpDisconnect { id: connection_id },
-            ).await;
+            )
+            .await;
         });
-        
+
         std::task::Poll::Ready(Ok(()))
     }
 }
@@ -332,7 +380,10 @@ fn into_backends(servers: &Vec<ServerConfig>) -> anyhow::Result<Backends> {
             }
             ServerConfig::Outpost { address, id } => {
                 upstreams.insert(Backend {
-                    addr: SocketAddr::Custom(address.clone(), Arc::new(VirtualConnector::new(id, address))),
+                    addr: SocketAddr::Custom(
+                        address.clone(),
+                        Arc::new(VirtualConnector::new(id, address)),
+                    ),
                     weight: 1,
                     ext: Extensions::new(),
                 });
@@ -344,8 +395,11 @@ fn into_backends(servers: &Vec<ServerConfig>) -> anyhow::Result<Backends> {
 
 impl From<HostConfig> for HostConfigWithBalancer {
     fn from(cfg: HostConfig) -> Self {
-        let load_balancer = LoadBalancer::<RoundRobin>::from_backends(into_backends(&cfg.upstream.servers).expect("Fail to create load balancer"));
-        load_balancer.update()
+        let load_balancer = LoadBalancer::<RoundRobin>::from_backends(
+            into_backends(&cfg.upstream.servers).expect("Fail to create load balancer"),
+        );
+        load_balancer
+            .update()
             .now_or_never()
             .expect("static should not block")
             .expect("static should not error");
@@ -362,14 +416,22 @@ impl From<Config> for FullConfig {
             listen_port: cfg.listen_port,
             listen_port_tls: cfg.listen_port_tls,
             outpost_listen_port: cfg.outpost_listen_port,
-            hosts: cfg.hosts.iter().map(|(k, v)| (k.clone(), Arc::new(HostConfigWithBalancer::from(v.clone())))).collect(),
-            certificates: cfg.certificates.iter().map(|c| {
-                let cert = c.read_cert().expect("Failed to read TLS certificate");
-                Arc::new(TlsCertConfigWithKey {
-                    config: c.clone(),
-                    cert,
+            hosts: cfg
+                .hosts
+                .iter()
+                .map(|(k, v)| (k.clone(), Arc::new(HostConfigWithBalancer::from(v.clone()))))
+                .collect(),
+            certificates: cfg
+                .certificates
+                .iter()
+                .map(|c| {
+                    let cert = c.read_cert().expect("Failed to read TLS certificate");
+                    Arc::new(TlsCertConfigWithKey {
+                        config: c.clone(),
+                        cert,
+                    })
                 })
-            }).collect(),
+                .collect(),
             outposts: cfg.outposts,
         }
     }
@@ -381,8 +443,17 @@ impl From<&FullConfig> for Config {
             listen_port: cfg.listen_port,
             listen_port_tls: cfg.listen_port_tls,
             outpost_listen_port: cfg.outpost_listen_port,
-            hosts: cfg.hosts.iter().map(|(k, v)| (k.clone(), v.config.clone())).collect(),
-            certificates: cfg.certificates.clone().iter().map(|c| c.config.clone()).collect(),
+            hosts: cfg
+                .hosts
+                .iter()
+                .map(|(k, v)| (k.clone(), v.config.clone()))
+                .collect(),
+            certificates: cfg
+                .certificates
+                .clone()
+                .iter()
+                .map(|c| c.config.clone())
+                .collect(),
             outposts: cfg.outposts.clone(),
         }
     }
@@ -401,7 +472,7 @@ impl FullConfig {
         tokio::fs::write(path, toml_string).await?;
         Ok(())
     }
-    
+
     pub fn listen_address(&self) -> String {
         format!("0.0.0.0:{}", self.listen_port)
     }
@@ -412,6 +483,7 @@ impl FullConfig {
 
     pub fn outpost_listen_address(&self) -> Option<String> {
         // TODO: QUIC doesn't like 0.0.0.0
-        self.outpost_listen_port.map(|port| format!("127.0.0.1:{}", port))
+        self.outpost_listen_port
+            .map(|port| format!("127.0.0.1:{}", port))
     }
 }
