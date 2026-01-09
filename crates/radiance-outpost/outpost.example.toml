@@ -1,0 +1,18 @@
+server_endpoint = "203.0.113.1:51820"
+shared_secret = "FFFFFFFFFFFFFFFF" # CHANGE ME: 8 random bytes in hex
+
+[[exposed_ports]]
+protocol = "tcp"
+port = 8080
+
+[[exposed_ports]]
+protocol = "tcp"
+port = 3000
+
+[[exposed_ports]]
+protocol = "udp"
+port = 53
+
+[[exposed_ports]]
+protocol = "tcp"
+port = 22

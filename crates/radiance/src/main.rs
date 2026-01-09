@@ -3,13 +3,15 @@ mod proxy;
 mod control_socket;
 pub mod environment;
 pub mod vault;
+pub mod protocol;
+pub mod outpost;
 
-use log::info;
-use pingora::{listeners::tls::TlsSettings, prelude::*, services::listening::Service, tls::ResolvesServerCert};
-use pingora_proxy::HttpProxy;
+use pingora::{listeners::tls::TlsSettings, prelude::*, tls::ResolvesServerCert};
 use pingora_rustls::ServerConfig;
 use rustls::{sign::CertifiedKey, version};
-use std::{env, sync::Arc, thread};
+use tracing::info;
+use tracing_subscriber::EnvFilter;
+use std::{collections::HashMap, sync::Arc, thread};
 use tokio::sync::RwLock;
 use proxy::RadianceProxy;
 use control_socket::ControlSocket;
@@ -31,6 +33,7 @@ async fn get_cert_for_sni(
     sni: &str,
     config: Arc<RwLock<FullConfig>>,
 ) -> Option<CertifiedKey> {
+    info!("Looking up certificate for SNI: {}", sni);
     let config = config.read().await;
     let id = config.hosts.values().find_map(|host_cfg| {
         if host_cfg.config.domains.iter().any(|d| normalize_match_domain(sni, d)) {
@@ -48,7 +51,11 @@ async fn get_cert_for_sni(
 #[tokio::main]
 async fn main() {
     dotenvy::dotenv().ok();
-    env_logger::init();
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .init();
     rustls::crypto::ring::default_provider().install_default().ok();
     info!("Starting Radiance reverse proxy");
 
@@ -62,6 +69,7 @@ async fn main() {
 
     let listen_address = config.listen_address();
     let listen_address_tls = config.listen_address_tls();
+    let outpost_address = config.outpost_listen_address();
     let shared_config = Arc::new(RwLock::new(config));
 
     let control_socket_path = std::env::var("CONTROL_SOCKET_PATH")
@@ -69,9 +77,16 @@ async fn main() {
     let control_socket = ControlSocket::new(control_socket_path, shared_config.clone());
     tokio::spawn(async move {
         if let Err(e) = control_socket.start().await {
-            log::error!("Control socket error: {}", e);
+            tracing::error!("Control socket error: {}", e);
         }
     });
+    let outposts = shared_config.read().await.outposts.clone().unwrap_or(HashMap::new());
+    if !outposts.is_empty() && outpost_address.is_some() {
+        info!("Initializing with {} outposts", outposts.len());
+        tokio::spawn(async move {
+            outpost::initialize_outposts(outpost_address.unwrap().parse().unwrap(), outposts).await.expect("Failed to initialize outposts");
+        });
+    }
 
     let mut proxy = Server::new(Some(Opt::default())).unwrap();
     proxy.bootstrap();

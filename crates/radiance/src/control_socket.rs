@@ -1,4 +1,4 @@
-use log::{error, info};
+use tracing::{error, info};
 use partially::Partial;
 use serde::{Deserialize, Serialize};
 use std::path::Path;

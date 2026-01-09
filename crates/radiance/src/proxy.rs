@@ -1,15 +1,13 @@
 use async_trait::async_trait;
-use http::{Uri, header, uri::{Parts, Scheme}};
-use log::{error, info};
+use http::header;
+use tracing::{error, info};
 use pingora::http::ResponseHeader;
 use pingora::prelude::*;
-use pingora_load_balancing::prelude::RoundRobin;
-use pingora_load_balancing::LoadBalancer;
 use pingora_proxy::{FailToProxy, ProxyHttp, Session};
 use ulid::Ulid;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use crate::config::{FullConfig, HostConfig, HostConfigWithBalancer};
+use crate::config::{FullConfig, HostConfigWithBalancer};
 
 pub type SharedConfig = Arc<RwLock<FullConfig>>;
 
@@ -60,9 +58,6 @@ impl RadianceProxy {
     pub fn new(config: SharedConfig) -> Self {
         Self { config }
     }
-    
-    // async fn get_host_config(&self, domain: &str) -> Option<&HostConfigWithBalancer> {
-    // }
 }
 
 #[async_trait]
@@ -89,32 +84,35 @@ impl ProxyHttp for RadianceProxy {
             .ok_or(pingora::Error::new_down(ErrorType::HTTPStatus(404)))?;
         ctx.host_config = Some(host_config.clone());
         ctx.normalized_host = host;
-        if let Some(true) = host_config.config.upgrade_https {
-            // redirect to HTTPS
-            let proto = session.req_header().uri.scheme().ok_or(
-                pingora::Error::new_down(ErrorType::InternalError)
-            )?;
-            if Scheme::HTTP == *proto {
-                let uri_parts = Uri::builder()
-                    .path_and_query(session.req_header().uri.path_and_query().unwrap().clone())
-                    .authority(session.req_header().uri.authority().unwrap().clone())
-                    .scheme("https")
-                    .build()
-                    .map_err(|_| pingora::Error::new_down(ErrorType::InternalError))?;
-                let mut resp = ResponseHeader::build(http::StatusCode::MOVED_PERMANENTLY, Some(4)).unwrap();
-                resp.insert_header(header::SERVER, "radiance")
-                    .unwrap();
-                resp.insert_header(header::CONTENT_LENGTH, 0).unwrap();
-                resp.insert_header(header::CACHE_CONTROL, "private, no-store")
-                    .unwrap();
-                resp.insert_header(header::LOCATION, uri_parts.to_string()).unwrap();
-                session.write_response_header(Box::new(resp), true).await?;
-                return Ok(true);
-            }
-            Ok(false)
-        } else {
-            Ok(false)
-        }
+        Ok(false)
+        // TODO: patch pingora to support TLS info in request_filter
+        // if let Some(true) = host_config.config.upgrade_https {
+        //     // redirect to HTTPS
+        //     info!("URI: {:?}", session.req_header().uri);
+        //     let proto = session.req_header().uri.scheme().ok_or(
+        //         pingora::Error::new_down(ErrorType::InternalError)
+        //     )?;
+        //     if Scheme::HTTP == *proto {
+        //         let uri_parts = Uri::builder()
+        //             .path_and_query(session.req_header().uri.path_and_query().unwrap().clone())
+        //             .authority(session.req_header().uri.authority().unwrap().clone())
+        //             .scheme("https")
+        //             .build()
+        //             .map_err(|_| pingora::Error::new_down(ErrorType::InternalError))?;
+        //         let mut resp = ResponseHeader::build(http::StatusCode::MOVED_PERMANENTLY, Some(4)).unwrap();
+        //         resp.insert_header(header::SERVER, "radiance")
+        //             .unwrap();
+        //         resp.insert_header(header::CONTENT_LENGTH, 0).unwrap();
+        //         resp.insert_header(header::CACHE_CONTROL, "private, no-store")
+        //             .unwrap();
+        //         resp.insert_header(header::LOCATION, uri_parts.to_string()).unwrap();
+        //         session.write_response_header(Box::new(resp), true).await?;
+        //         return Ok(true);
+        //     }
+        //     Ok(false)
+        // } else {
+        //     Ok(false)
+        // }
     }
 
     async fn proxy_upstream_filter(
@@ -154,7 +152,7 @@ impl ProxyHttp for RadianceProxy {
             } else {
                 String::new()
             };
-            let peer = Box::new(HttpPeer::new(
+            let peer = Box::new(HttpPeer::new_from_sockaddr(
                 upstream.addr,
                 host_config.config.upstream.tls,
                 sni,
