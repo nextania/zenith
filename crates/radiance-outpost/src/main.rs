@@ -40,7 +40,7 @@ async fn main() -> Result<()> {
         .init();
 
     info!("Starting Radiance Outpost");
-
+    rustls::crypto::ring::default_provider().install_default().ok();
     let config = Config::from_file(&args.config).context("Failed to load configuration")?;
     config.validate().context("Invalid configuration")?;
 

@@ -68,17 +68,17 @@ pub enum ProtocolC2S {
 #[derive(Archive, Deserialize, Serialize, Debug)]
 #[rkyv(derive(Debug))]
 pub struct StreamS2C {
-    pub cid: u64,
+    pub cid: u128,
     pub msg: ProtocolS2C,
 }
 #[derive(Archive, Deserialize, Serialize, Debug)]
 pub struct StreamC2S {
-    pub cid: u64,
+    pub cid: u128,
     pub msg: ProtocolC2S,
 }
 #[derive(Archive, Deserialize, Serialize, Debug)]
 pub struct DatagramMessage {
-    pub cid: u64,
+    pub cid: u128,
     pub data: Vec<u8>,
     pub host: String,
     pub port: u16,

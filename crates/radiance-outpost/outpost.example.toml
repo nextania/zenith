@@ -1,5 +1,5 @@
 server_endpoint = "203.0.113.1:51820"
-shared_secret = "FFFFFFFFFFFFFFFF" # CHANGE ME: 8 random bytes in hex
+shared_secret = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF" # CHANGE ME: 16 random bytes in hex
 
 [[exposed_ports]]
 protocol = "tcp"

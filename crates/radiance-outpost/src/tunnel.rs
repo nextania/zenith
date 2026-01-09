@@ -1,13 +1,11 @@
 use anyhow::{Context, Result};
-use quiche::Config;
-use rand::RngCore;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::UdpSocket;
-use tokio::time::{sleep, Sleep};
 use tracing::{debug, error, info, warn};
+use quinn::{ClientConfig, Endpoint, Connection, RecvStream, SendStream};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 
 use crate::tcp_forwarder::TcpEvent;
 use crate::{
@@ -19,310 +17,272 @@ use crate::{
     udp_forwarder::UdpForwarder,
 };
 
-const MAX_BUFFER_SIZE: usize = 10 * 1024 * 1024; // 10MB max buffer
-const MAX_DATAGRAM_SIZE: usize = 1350;
+#[derive(Debug)]
+struct SkipServerVerification(Arc<rustls::crypto::CryptoProvider>);
 
-// TODO: determine if GSO is needed
-// TODO: also put this on the server 
-#[cfg(target_os = "linux")]
-pub fn try_enable_udp_gro(socket: &UdpSocket) -> Result<()> {
-    use nix::sys::socket::{setsockopt, sockopt::UdpGroSegment};
+impl SkipServerVerification {
+    fn new() -> Arc<Self> {
+        Arc::new(Self(Arc::new(rustls::crypto::ring::default_provider())))
+    }
+}
 
-    setsockopt(socket, UdpGroSegment, &true).context("Failed to enable UDP GRO on socket")
+impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp: &[u8],
+        _now: UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
 }
 
 pub struct Tunnel {
-    socket: UdpSocket,
-    quic: quiche::Connection,
-    server_endpoint: SocketAddr,
-    stream_buffers: HashMap<u64, Vec<u8>>,
-    tcp_stream_map: HashMap<u64, u64>, // TCP connection ID -> QUIC stream ID
-    next_stream_id: u64, // see: IETF specification
-    shared_secret: u64,
-    is_established: bool,
+    connection: Connection,
+    tcp_stream_map: HashMap<u64, SendStream>, // TCP connection ID -> QUIC send stream
+    shared_secret: u128,
 }
 
 impl Tunnel {
     pub async fn new(server_endpoint: SocketAddr, shared_secret: &str) -> Result<Self> {
-        let mut quic_config = Config::new(quiche::PROTOCOL_VERSION)
-            .context("Failed to create QUIC config")?;
-        quic_config.set_application_protos(&[b"radiance-outpost"])?;
-        quic_config.set_max_idle_timeout(60000); // 60 seconds
-        quic_config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
-        quic_config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
-        quic_config.set_initial_max_data(10_000_000);
-        quic_config.set_initial_max_stream_data_bidi_local(1_000_000);
-        quic_config.set_initial_max_stream_data_bidi_remote(1_000_000);
-        quic_config.set_initial_max_streams_bidi(1000000);
-        quic_config.set_initial_max_streams_uni(100);
-        quic_config.set_disable_active_migration(true);
-        quic_config.enable_dgram(true, 1000, 1000);
-
-        // TODO: proper cert verification
-        quic_config.verify_peer(false);
-
+        // TODO: proper server certificate verification
+        let mut crypto = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(SkipServerVerification::new())
+            .with_no_client_auth();
+        crypto.alpn_protocols = vec![b"radiance-outpost".to_vec()];
+        let mut client_config = ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
+                .context("Failed to create QUIC crypto config")?
+        ));
+        let mut transport_config = quinn::TransportConfig::default();
+        transport_config.max_idle_timeout(Some(Duration::from_secs(60).try_into().unwrap()));
+        transport_config.receive_window(10_000_000u32.into());
+        transport_config.send_window(10_000_000u64);
+        transport_config.stream_receive_window(1_000_000u32.into());
+        transport_config.max_concurrent_bidi_streams(1000000u32.into());
+        transport_config.max_concurrent_uni_streams(100u32.into());
+        transport_config.datagram_receive_buffer_size(Some(1000));
+        transport_config.datagram_send_buffer_size(1000);
+        transport_config.keep_alive_interval(Some(Duration::from_secs(30).try_into().unwrap()));
+        client_config.transport_config(Arc::new(transport_config));
         let bind_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
-
-        let socket = UdpSocket::bind(bind_addr).await.context("Failed to bind UDP socket")?;
-        #[cfg(target_os = "linux")]
-        try_enable_udp_gro(&socket)?;
-
-        info!(
-            "Tunnel initialized on {} -> {}",
-            socket.local_addr()?,
-            server_endpoint
-        );
-
-        let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
-        rand::rng().fill_bytes(&mut scid);
-        let connection_id = quiche::ConnectionId::from_ref(&scid);
-
-        let local_addr = socket.local_addr()?;
-        let quic = quiche::connect(None, &connection_id, local_addr, server_endpoint, &mut quic_config)
-            .context("Failed to create QUIC connection")?;
-
+        let mut endpoint = Endpoint::client(bind_addr)
+            .context("Failed to create QUIC endpoint")?;
+        endpoint.set_default_client_config(client_config);
+        info!("Tunnel initialized on {} -> {}", endpoint.local_addr()?, server_endpoint);
+        let connection = endpoint
+            .connect(server_endpoint, "radiance-outpost")
+            .context("Failed to initiate connection")?
+            .await
+            .context("Failed to establish connection")?;
+        info!("QUIC connection established to {}", server_endpoint);
+        let shared_secret_num = u128::from_str_radix(shared_secret, 16)
+            .context("Invalid shared secret (must be hex)")?;
+        let msg = StreamC2S {
+            cid: shared_secret_num,
+            msg: ProtocolC2S::Identify,
+        };
+        let buf = rkyv::to_bytes::<rkyv::rancor::Error>(&msg)
+            .context("Failed to serialize Identify message")?;
+        let mut send_buf = Vec::new();
+        send_buf.extend_from_slice(&(buf.len() as u16).to_be_bytes());
+        send_buf.extend_from_slice(&buf);
+        let (mut send, _recv) = connection.open_bi().await.context("Failed to open stream")?;
+        send.write_all(&send_buf).await.context("Failed to send identify")?;
         Ok(Self {
-            socket,
-            quic,
-            server_endpoint,
-            stream_buffers: HashMap::new(),
+            connection,
             tcp_stream_map: HashMap::new(),
-            next_stream_id: 4,
-            shared_secret: u64::from_str_radix(shared_secret, 16)
-                .context("Invalid shared secret (must be hex)")?,
-            is_established: false,
+            shared_secret: shared_secret_num,
         })
     }
     
     pub async fn run(&mut self, tcp: TcpForwarder, udp: UdpForwarder) -> Result<()> {
-        let mut buf = [0; 65535];
-        self.flush_egress().await?;
         loop {
-            let mut timeout: Pin<Box<Sleep>> = if let Some(quic_timeout) = self.quic.timeout() {
-                Box::pin(sleep(quic_timeout))
-            } else {
-                Box::pin(sleep(Duration::from_secs(3600)))
-            };
-
             tokio::select! {
-                result = self.socket.recv_from(&mut buf) => {
-                    match result {
-                        Ok((len, addr)) => {
-                            if addr != self.server_endpoint {
-                                warn!("Received packet from unexpected address: {}", addr);
-                                continue;
-                            }
-                            // NOTE: 0.0.0.0 != 127.0.0.1
-                            debug!("Received {} bytes from server, is_established: {}, quic.is_established(): {}", 
-                                len, self.is_established, self.quic.is_established());
-                            if let Err(e) = self.handle_incoming_packet(&mut buf[..len], addr).await {
-                                error!("Error handling incoming packet: {}", e);
-                            }
-                            if !self.is_established && self.quic.is_established() {
-                                self.is_established = true;
-                                info!("QUIC connection established");
-                                let msg = StreamC2S {
-                                    cid: self.shared_secret,
-                                    msg: ProtocolC2S::Identify,
-                                };
-                                let buf = rkyv::to_bytes::<rkyv::rancor::Error>(&msg)
-                                    .context("Failed to serialize Identify message")?;
-                                let mut send_buf = Vec::new();
-                                send_buf.extend_from_slice(&(buf.len() as u16).to_be_bytes());
-                                send_buf.extend_from_slice(&buf);
-                                match self.quic.stream_send(0, &send_buf, false) {
-                                    Ok(written) => {
-                                        if written < send_buf.len() {
-                                            warn!(
-                                                "Partial write to stream 0: {} < {}",
-                                                written,
-                                                send_buf.len()
-                                            );
-                                        }
-                                    }
-                                    Err(quiche::Error::Done) => {
-                                        debug!("Stream 0 blocked, will retry");
-                                    }
-                                    Err(e) => {
-                                        error!("Failed to send Identify message over QUIC: {:?}", e);
-                                    }
+                stream_result = self.connection.accept_bi() => {
+                    match stream_result {
+                        Ok((_send, recv)) => {
+                            let tcp = tcp.clone();
+                            let udp = udp.clone();
+                            let shared_secret = self.shared_secret;
+                            tokio::spawn(async move {
+                                if let Err(e) = Self::handle_incoming_stream(recv, tcp, udp, shared_secret).await {
+                                    error!("Error handling incoming stream: {}", e);
                                 }
-                            }
-                            if let Err(e) = self.process_readable_streams(&tcp).await {
-                                error!("Error processing streams: {}", e);
-                            }
-                            if let Err(e) = self.process_datagrams(&udp).await {
-                                error!("Error processing datagrams: {}", e);
-                            }
-                            self.flush_egress().await?;
+                            });
+                        }
+                        Err(quinn::ConnectionError::ApplicationClosed(_)) => {
+                            info!("Connection closed by peer");
+                            return Err(anyhow::anyhow!("Connection closed"));
                         }
                         Err(e) => {
-                            error!("UDP socket receive error: {}", e);
+                            error!("Error accepting stream: {}", e);
                             return Err(e.into());
                         }
                     }
                 }
 
-                _ = &mut timeout => {
-                    debug!("QUIC timeout triggered");
-                    self.quic.on_timeout();
-                    self.flush_egress().await?;
+                datagram_result = self.connection.read_datagram() => {
+                    match datagram_result {
+                        Ok(data) => {
+                            if let Err(e) = self.handle_datagram(&data, &udp).await {
+                                error!("Error handling datagram: {}", e);
+                            }
+                        }
+                        Err(quinn::ConnectionError::ApplicationClosed(_)) => {
+                            info!("Connection closed by peer");
+                            return Err(anyhow::anyhow!("Connection closed"));
+                        }
+                        Err(e) => {
+                            error!("Error reading datagram: {}", e);
+                        }
+                    }
                 }
 
                 _ = tokio::time::sleep(Duration::from_millis(1)) => {
-                    if self.is_established {
-                        if let Err(e) = self.send_tcp_events(&tcp).await {
-                            error!("Error sending TCP events: {}", e);
-                        }
-                        if let Err(e) = self.send_tcp_data(&tcp).await {
-                            error!("Error sending TCP data: {}", e);
-                        }
-                        if let Err(e) = self.send_udp_data(&udp).await {
-                            error!("Error sending UDP data: {}", e);
-                        }
+                    if let Err(e) = self.send_tcp_events(&tcp).await {
+                        error!("Error sending TCP events: {}", e);
                     }
-                    self.flush_egress().await?;
+                    if let Err(e) = self.send_tcp_data(&tcp).await {
+                        error!("Error sending TCP data: {}", e);
+                    }
+                    if let Err(e) = self.send_udp_data(&udp).await {
+                        error!("Error sending UDP data: {}", e);
+                    }
                 }
             }
-
-            if self.quic.is_closed() {
-                warn!("QUIC connection closed");
-                warn!("Timed out: {:?}", self.quic.is_timed_out());
+            if self.connection.close_reason().is_some() {
+                warn!("QUIC connection closed: {:?}", self.connection.close_reason());
                 return Err(anyhow::anyhow!("QUIC connection closed"));
             }
         }
     }
 
-    async fn handle_incoming_packet(&mut self, packet: &mut [u8], from: SocketAddr) -> Result<()> {
-        let local_addr = self.socket.local_addr()?;
-        let info = quiche::RecvInfo {
-            from,
-            to: local_addr,
-        };
-        self.quic.recv(packet, info).context("Failed to process incoming QUIC packet")?;
-        Ok(())
-    }
-
-    async fn process_readable_streams(&mut self, tcp: &TcpForwarder) -> Result<()> {
-        for stream_id in self.quic.readable() {
-            loop {
-                let mut stream_buf = [0u8; 8192];
-                match self.quic.stream_recv(stream_id, &mut stream_buf) {
-                    Ok((read_len, fin)) => {
-                        let buffer = self.stream_buffers.entry(stream_id).or_insert_with(Vec::new);
-                        if buffer.len() + read_len > MAX_BUFFER_SIZE {
-                            warn!(
-                                "Stream {} buffer size limit exceeded, dropping connection",
-                                stream_id
-                            );
-                            self.stream_buffers.remove(&stream_id);
-                            let _ = self.quic.stream_shutdown(stream_id, quiche::Shutdown::Read, 0);
+    async fn handle_incoming_stream(
+        mut recv: RecvStream,
+        tcp: TcpForwarder,
+        udp: UdpForwarder,
+        shared_secret: u128,
+    ) -> Result<()> {
+        let mut buffer = Vec::new();
+        loop {
+            let mut chunk = [0u8; 8192];
+            match recv.read(&mut chunk).await {
+                Ok(Some(len)) => {
+                    buffer.extend_from_slice(&chunk[..len]);
+                    while buffer.len() >= 2 {
+                        let msg_len = u16::from_be_bytes([buffer[0], buffer[1]]) as usize;
+                        if buffer.len() < msg_len + 2 {
                             break;
                         }
-                        buffer.extend_from_slice(&stream_buf[..read_len]);
-                        self.process_stream_messages(stream_id, tcp)?;
-                        if fin {
-                            self.stream_buffers.remove(&stream_id);
-                            break;
-                        }
-                        // TODO: cleanup tcp stream
-                    }
-                    Err(quiche::Error::Done) => {
-                        break;
-                    }
-                    Err(e) => {
-                        error!("Failed to read from stream {}: {:?}", stream_id, e);
-                        self.stream_buffers.remove(&stream_id);
-                        break;
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn process_stream_messages(&mut self, stream_id: u64, tcp: &TcpForwarder) -> Result<()> {
-        let buffer = match self.stream_buffers.get_mut(&stream_id) {
-            Some(b) => b,
-            None => return Ok(()),
-        };
-        while buffer.len() >= 2 {
-            let msg_len = u16::from_be_bytes([buffer[0], buffer[1]]) as usize;
-            if buffer.len() < msg_len + 2 {
-                break;
-            }
-            let msg_data: Vec<u8> = buffer.drain(0..msg_len + 2).skip(2).collect();
-            match rkyv::access::<ArchivedStreamS2C, rkyv::rancor::Error>(&msg_data) {
-                Ok(data) => {
-                    if data.cid.to_native() != self.shared_secret {
-                        warn!("Received message with invalid cid: {}", data.cid);
-                        continue;
-                    }
-                    info!("Processing stream message: {:?}", data.msg);
-                    match &data.msg {
-                        ArchivedProtocolS2C::Tcp { id, data } => {
-                            let tcp_id = id.to_native();
-                            self.tcp_stream_map.entry(tcp_id).or_insert(stream_id);
-                            tcp.send_data(tcp_id, data.as_slice());
-                        }
-                        ArchivedProtocolS2C::TcpConnect { id, destination_host, destination_port } => {
-                            let tcp_id = id.to_native();
-                            self.tcp_stream_map.entry(tcp_id).or_insert(stream_id);
-                            tcp.connect(tcp_id, destination_host.as_str(), destination_port.to_native());
-                        }
-                        ArchivedProtocolS2C::TcpDisconnect { id } => {
-                            let tcp_id = id.to_native();
-                            self.tcp_stream_map.remove(&tcp_id);
-                            tcp.disconnect(tcp_id);
-                        }
-                        ArchivedProtocolS2C::SignalFwdAdd { host, port, req } => {
-                            debug!("TODO: SignalFwdAdd {}:{}", host, port);
-                        }
-                        ArchivedProtocolS2C::SignalFwdRemove { host, port, req } => {
-                            debug!("TODO: SignalFwdRemove {}:{}", host, port);
-                        }
-                        ArchivedProtocolS2C::SignalFwdList { req } => {
-                            debug!("TODO: SignalFwdList");
-                        }
-                        ArchivedProtocolS2C::Dns { host, req } => {
-                            debug!("TODO: DNS query for {}", host);
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("Failed to deserialize message: {:?}", e);
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn process_datagrams(&mut self, udp: &UdpForwarder) -> Result<()> {
-        while self.quic.dgram_recv_queue_len() > 0 {
-            let mut dgram_buf = [0u8; 65535];
-            match self.quic.dgram_recv(&mut dgram_buf) {
-                Ok(len) => {
-                    match rkyv::access::<ArchivedDatagramMessage, rkyv::rancor::Error>(
-                        &dgram_buf[..len],
-                    ) {
-                        Ok(data) => {
-                            if data.cid.to_native() != self.shared_secret {
-                                warn!("Received datagram with invalid cid: {}", data.cid);
-                                continue;
+                        let msg_data: Vec<u8> = buffer.drain(0..msg_len + 2).skip(2).collect();
+                        match rkyv::access::<ArchivedStreamS2C, rkyv::rancor::Error>(&msg_data) {
+                            Ok(data) => {
+                                if data.cid.to_native() != shared_secret {
+                                    warn!("Received message with invalid cid: {}", data.cid);
+                                    continue;
+                                }
+                                info!("Processing stream message: {:?}", data.msg);
+                                Self::handle_protocol_message(&data.msg, &tcp, &udp);
                             }
-                            udp.delegate(data.data.as_slice(), &data.host, data.port.to_native());
-                        }
-                        Err(e) => {
-                            warn!("Failed to deserialize datagram: {:?}", e);
+                            Err(e) => {
+                                warn!("Failed to deserialize message: {:?}", e);
+                            }
                         }
                     }
                 }
-                Err(quiche::Error::Done) => break,
-                Err(e) => {
-                    warn!("Failed to read datagram: {:?}", e);
+                Ok(None) => {
+                    debug!("Stream finished");
                     break;
                 }
+                Err(e) => {
+                    error!("Error reading from stream: {}", e);
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_protocol_message(
+        msg: &ArchivedProtocolS2C,
+        tcp: &TcpForwarder,
+        _udp: &UdpForwarder,
+    ) {
+        match msg {
+            ArchivedProtocolS2C::Tcp { id, data } => {
+                let tcp_id = id.to_native();
+                tcp.send_data(tcp_id, data.as_slice());
+            }
+            ArchivedProtocolS2C::TcpConnect { id, destination_host, destination_port } => {
+                let tcp_id = id.to_native();
+                tcp.connect(tcp_id, destination_host.as_str(), destination_port.to_native());
+            }
+            ArchivedProtocolS2C::TcpDisconnect { id } => {
+                let tcp_id = id.to_native();
+                tcp.disconnect(tcp_id);
+            }
+            ArchivedProtocolS2C::SignalFwdAdd { host, port, .. } => {
+                debug!("TODO: SignalFwdAdd {}:{}", host, port);
+            }
+            ArchivedProtocolS2C::SignalFwdRemove { host, port, .. } => {
+                debug!("TODO: SignalFwdRemove {}:{}", host, port);
+            }
+            ArchivedProtocolS2C::SignalFwdList { .. } => {
+                debug!("TODO: SignalFwdList");
+            }
+            ArchivedProtocolS2C::Dns { host, .. } => {
+                debug!("TODO: DNS query for {}", host);
+            }
+        }
+    }
+
+    async fn handle_datagram(&self, data: &[u8], udp: &UdpForwarder) -> Result<()> {
+        match rkyv::access::<ArchivedDatagramMessage, rkyv::rancor::Error>(data) {
+            Ok(msg) => {
+                if msg.cid.to_native() != self.shared_secret {
+                    warn!("Received datagram with invalid cid: {}", msg.cid);
+                    return Ok(());
+                }
+                udp.delegate(msg.data.as_slice(), &msg.host, msg.port.to_native());
+            }
+            Err(e) => {
+                warn!("Failed to deserialize datagram: {:?}", e);
             }
         }
         Ok(())
@@ -337,34 +297,19 @@ impl Tunnel {
                         cid: self.shared_secret,
                         msg: ProtocolC2S::TcpConnect { id },
                     };
-                    
                     let buf = rkyv::to_bytes::<rkyv::rancor::Error>(&msg)
                         .context("Failed to serialize TcpConnect message")?;
                     let mut send_buf = Vec::new();
                     send_buf.extend_from_slice(&(buf.len() as u16).to_be_bytes());
                     send_buf.extend_from_slice(&buf);
-                    
-                    let stream_id = if let Some(&sid) = self.tcp_stream_map.get(&id) {
-                        sid
-                    } else {
-                        let sid = self.next_stream_id;
-                        self.tcp_stream_map.insert(id, sid);
-                        self.next_stream_id += 4;
-                        sid
-                    };
-                    
-                    match self.quic.stream_send(stream_id, &send_buf, false) {
-                        Ok(written) => {
-                            if written < send_buf.len() {
-                                warn!("Partial write to stream {}: {} < {}", stream_id, written, send_buf.len());
-                            }
-                        }
-                        Err(quiche::Error::Done) => {
-                            debug!("Stream {} blocked, will retry", stream_id);
-                        }
-                        Err(e) => {
-                            error!("Failed to send TcpConnect message over QUIC: {:?}", e);
-                        }
+                    if !self.tcp_stream_map.contains_key(&id) {
+                        let (send, _recv) = self.connection.open_bi().await
+                            .context("Failed to open bi-directional stream")?;
+                        self.tcp_stream_map.insert(id, send);
+                    }
+                    if let Some(stream) = self.tcp_stream_map.get_mut(&id) {
+                        stream.write_all(&send_buf).await
+                            .context("Failed to write TcpConnect message")?;
                     }
                 }
                 TcpEvent::Disconnected { id } => {
@@ -372,28 +317,14 @@ impl Tunnel {
                         cid: self.shared_secret,
                         msg: ProtocolC2S::TcpDisconnect { id },
                     };
-                    
                     let buf = rkyv::to_bytes::<rkyv::rancor::Error>(&msg)
                         .context("Failed to serialize TcpDisconnect message")?;
                     let mut send_buf = Vec::new();
                     send_buf.extend_from_slice(&(buf.len() as u16).to_be_bytes());
                     send_buf.extend_from_slice(&buf);
-                    
-                    if let Some(&stream_id) = self.tcp_stream_map.get(&id) {
-                        match self.quic.stream_send(stream_id, &send_buf, false) {
-                            Ok(written) => {
-                                if written < send_buf.len() {
-                                    warn!("Partial write to stream {}: {} < {}", stream_id, written, send_buf.len());
-                                }
-                            }
-                            Err(quiche::Error::Done) => {
-                                debug!("Stream {} blocked, will retry", stream_id);
-                            }
-                            Err(e) => {
-                                error!("Failed to send TcpDisconnect message over QUIC: {:?}", e);
-                            }
-                        }
-                        self.tcp_stream_map.remove(&id);
+                    if let Some(mut stream) = self.tcp_stream_map.remove(&id) {
+                        let _ = stream.write_all(&send_buf).await;
+                        let _ = stream.finish();
                     }
                 }
             }
@@ -403,16 +334,11 @@ impl Tunnel {
     
     async fn send_tcp_data(&mut self, tcp: &TcpForwarder) -> Result<()> {
         while let Some(data) = tcp.flush() {
-            let stream_id = if let Some(&sid) = self.tcp_stream_map.get(&data.id) {
-                sid
-            } else {
-                // this shouldn't happen, but create a new stream just in case
-                let sid = self.next_stream_id;
-                self.tcp_stream_map.insert(data.id, sid);
-                self.next_stream_id += 4; 
-                sid
-            };
-
+            if !self.tcp_stream_map.contains_key(&data.id) {
+                let (send, _recv) = self.connection.open_bi().await
+                    .context("Failed to open bi-directional stream")?;
+                self.tcp_stream_map.insert(data.id, send);
+            }
             let msg = StreamC2S {
                 cid: self.shared_secret,
                 msg: ProtocolC2S::Tcp {
@@ -422,29 +348,14 @@ impl Tunnel {
                     id: data.id,
                 },
             };
-
             let buf = rkyv::to_bytes::<rkyv::rancor::Error>(&msg)
                 .context("Failed to serialize TCP message")?;
             let mut send_buf = Vec::new();
             send_buf.extend_from_slice(&(buf.len() as u16).to_be_bytes());
             send_buf.extend_from_slice(&buf);
-
-            match self.quic.stream_send(stream_id, &send_buf, false) {
-                Ok(written) => {
-                    if written < send_buf.len() {
-                        warn!(
-                            "Partial write to stream {}: {} < {}",
-                            stream_id,
-                            written,
-                            send_buf.len()
-                        );
-                    }
-                }
-                Err(quiche::Error::Done) => {
-                    debug!("Stream {} blocked, will retry", stream_id);
-                }
-                Err(e) => {
-                    error!("Failed to send TCP message over QUIC: {:?}", e);
+            if let Some(stream) = self.tcp_stream_map.get_mut(&data.id) {
+                if let Err(e) = stream.write_all(&send_buf).await {
+                    error!("Failed to send TCP data: {}", e);
                     self.tcp_stream_map.remove(&data.id);
                 }
             }
@@ -462,35 +373,18 @@ impl Tunnel {
             };
             let buf = rkyv::to_bytes::<rkyv::rancor::Error>(&msg)
                 .context("Failed to serialize datagram")?;
-
-            match self.quic.dgram_send(&buf) {
-                Ok(_) => {}
-                Err(quiche::Error::Done) => {
-                    debug!("Datagram queue full, dropping packet");
-                }
-                Err(e) => {
-                    error!("Failed to send datagram over QUIC: {:?}", e);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn flush_egress(&mut self) -> Result<()> {
-        let mut buf = [0u8; MAX_DATAGRAM_SIZE];
-        loop {
-            match self.quic.send(&mut buf) {
-                Ok((len, send_info)) => {
-                    debug!("Sending {} bytes to server", len);
-                    self.socket
-                        .send_to(&buf[..len], send_info.to)
-                        .await
-                        .context("Failed to send QUIC packet")?;
-                }
-                Err(quiche::Error::Done) => break,
-                Err(e) => {
-                    error!("Failed to create QUIC packet: {:?}", e);
-                    break;
+            if let Err(e) = self.connection.send_datagram(buf.to_vec().into()) {
+                match e {
+                    quinn::SendDatagramError::TooLarge => {
+                        debug!("Datagram too large, dropping packet");
+                    }
+                    quinn::SendDatagramError::ConnectionLost(_) => {
+                        error!("Connection lost while sending datagram");
+                        return Err(anyhow::anyhow!("Connection lost"));
+                    }
+                    _ => {
+                        error!("Failed to send datagram: {:?}", e);
+                    }
                 }
             }
         }
