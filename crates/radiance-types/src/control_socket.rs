@@ -19,7 +19,7 @@ pub enum ControlCommand {
 pub enum ControlResponse {
     Success {
         message: String,
-        data: Option<Vec<u8>>,
+        data: Option<serde_json::Value>,
     },
     Error {
         message: String,

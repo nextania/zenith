@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use serde::{Deserialize, Serialize};
+use radiance_types::{ControlCommand, ControlResponse};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 
@@ -21,26 +21,6 @@ enum Commands {
         id: String,
     },
     Reload,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "command", rename_all = "snake_case")]
-enum ControlCommand {
-    ListHosts,
-    Reload,
-    GetHost { id: String },
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-enum ControlResponse {
-    Success {
-        message: String,
-        data: Option<serde_json::Value>,
-    },
-    Error {
-        message: String,
-    },
 }
 
 fn main() {

@@ -186,8 +186,9 @@ async fn remove_host(config: SharedConfig, id: String) -> ControlResponse {
 
 async fn list_hosts(config: SharedConfig) -> ControlResponse {
     let cfg = config.read().await;
+    let cfg: Config = (&*cfg).into();
     let hosts_json =
-        serde_json::to_value::<Config>((&*cfg).into()).unwrap_or(serde_json::Value::Null);
+        serde_json::to_value(&cfg.hosts).unwrap_or(serde_json::Value::Null);
     ControlResponse::Success {
         message: format!("Found {} host(s)", cfg.hosts.len()),
         data: Some(hosts_json),
