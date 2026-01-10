@@ -130,14 +130,33 @@ impl ProxyHttp for RadianceProxy {
 
     async fn proxy_upstream_filter(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         _ctx: &mut Self::CTX,
     ) -> Result<bool> {
+        // Handle ACME challenge requests
+        if session.req_header().uri.path().starts_with("/.well-known/acme-challenge/") {
+            let config = self.config.read().await;
+            let domain = session
+                .get_header("HOST")
+                .map(|h| h.to_str().unwrap())
+                .ok_or(pingora::Error::new_down(ErrorType::InvalidHTTPHeader))?;
+            let domain = normalize_domain(domain);
+            if let Some((token, thumbprint)) = config.active_challenges.get(&domain) {
+                let path = session.req_header().uri.path();
+                let expected_path = format!("/.well-known/acme-challenge/{}", token);
+                if path == expected_path {
+                    let mut resp = ResponseHeader::build(200, Some(3)).unwrap();
+                    resp.insert_header(header::SERVER, "radiance").unwrap();
+                    resp.insert_header(header::CONTENT_TYPE, "text/plain").unwrap();
+                    let body = format!("{}.{}", token, thumbprint).into_bytes();
+                    resp.insert_header(header::CONTENT_LENGTH, body.len().to_string()).unwrap();
+                    session.write_response_header(Box::new(resp), false).await?;
+                    session.write_response_body(Some(body.into()), true).await?;
+                    return Ok(true);
+                }
+            }
+        }
         // TODO:
-        // Check if this request is to .well-known/acme-challenge/
-        // if session.req_header().uri.path().starts_with("/.well-known/acme-challenge/") {
-        //     // Handle ACME challenge requests
-        // }
         // Check if this request needs to be proxied differently
         // Check forward auth
         Ok(true)
@@ -145,7 +164,7 @@ impl ProxyHttp for RadianceProxy {
 
     async fn upstream_peer(
         &self,
-        session: &mut Session,
+        _session: &mut Session,
         ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
         let host_config = ctx

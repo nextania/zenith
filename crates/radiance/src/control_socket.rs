@@ -93,6 +93,35 @@ async fn process_command(command: ControlCommand, config: SharedConfig) -> Contr
         ControlCommand::ListHosts => list_hosts(config).await,
         ControlCommand::GetHost { id } => get_host(config, id).await,
         ControlCommand::Reload => reload_config(config).await,
+        ControlCommand::ClearHttpChallenge { domain, token } => clear_http_challenge(config, domain, token).await,
+        ControlCommand::SetHttpChallenge { domain, token, thumbprint } => set_http_challenge(config, domain, token, thumbprint).await,
+    }
+}
+
+async fn set_http_challenge(config: SharedConfig, domain: String, token: String, thumbprint: String) -> ControlResponse {
+    let mut cfg = config.write().await;
+    cfg.active_challenges.insert(domain.clone(), (token.clone(), thumbprint.clone()));
+    info!("Set HTTP challenge for domain: {}", domain);
+    ControlResponse::Success {
+        message: format!("HTTP challenge set for domain: {}", domain),
+        data: None,
+    }
+}
+
+async fn clear_http_challenge(config: SharedConfig, domain: String, token: String) -> ControlResponse {
+    let mut cfg = config.write().await;
+    match cfg.active_challenges.get(&domain) {
+        Some((stored_token, _)) if *stored_token == token => {
+            cfg.active_challenges.remove(&domain);
+            info!("Cleared HTTP challenge for domain: {}", domain);
+            ControlResponse::Success {
+                message: format!("HTTP challenge cleared for domain: {}", domain),
+                data: None,
+            }
+        }
+        _ => ControlResponse::Error {
+            message: format!("No matching HTTP challenge found for domain: {}", domain),
+        },
     }
 }
 

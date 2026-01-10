@@ -103,6 +103,7 @@ pub struct FullConfig {
     pub hosts: HashMap<String, Arc<HostConfigWithBalancer>>,
     pub certificates: Vec<Arc<TlsCertConfigWithKey>>,
     pub outposts: Option<HashMap<String, OutpostConfig>>,
+    pub active_challenges: HashMap<String, (String, String)>, // domain -> (token, thumbprint)
 }
 
 pub struct HostConfigWithBalancer {
@@ -177,6 +178,7 @@ impl From<Config> for FullConfig {
                 })
                 .collect(),
             outposts: cfg.outposts,
+            active_challenges: HashMap::new(),
         }
     }
 }
