@@ -2,7 +2,6 @@ mod config;
 mod control_socket;
 pub mod environment;
 pub mod outpost;
-pub mod protocol;
 mod proxy;
 pub mod vault;
 

@@ -7,12 +7,12 @@ use quinn::{Connection, Endpoint, RecvStream, SendStream, ServerConfig};
 use rand::RngCore;
 use tokio::sync::{mpsc::UnboundedSender, oneshot};
 use tracing::{debug, error, info, warn};
+use radiance_types::{
+    ArchivedDatagramMessage, ArchivedProtocolC2S, ArchivedStreamC2S, ProtocolS2C, StreamS2C,
+};
 
 use crate::{
     config::OutpostConfig,
-    protocol::{
-        ArchivedDatagramMessage, ArchivedProtocolC2S, ArchivedStreamC2S, ProtocolS2C, StreamS2C,
-    },
 };
 
 lazy_static! {

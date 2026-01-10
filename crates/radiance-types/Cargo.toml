@@ -1,0 +1,9 @@
+[package]
+name = "radiance-types"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serde = "1.0.219"
+partially = { version = "0.2.1", features = ["derive"] }
+rkyv = "0.8.13"

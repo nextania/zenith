@@ -7,12 +7,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
+use radiance_types::{
+    ArchivedDatagramMessage, ArchivedProtocolS2C, ArchivedStreamS2C, DatagramMessage,
+    ProtocolC2S, StreamC2S,
+};
 use crate::tcp_forwarder::TcpEvent;
 use crate::{
-    protocol::{
-        ArchivedDatagramMessage, ArchivedProtocolS2C, ArchivedStreamS2C, DatagramMessage,
-        ProtocolC2S, StreamC2S,
-    },
     tcp_forwarder::TcpForwarder,
     udp_forwarder::UdpForwarder,
 };

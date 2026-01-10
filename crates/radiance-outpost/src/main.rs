@@ -1,5 +1,4 @@
 mod config;
-mod protocol;
 mod tcp_forwarder;
 mod tunnel;
 mod udp_forwarder;

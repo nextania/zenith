@@ -1,6 +1,7 @@
 use rkyv::{Archive, Deserialize, Serialize};
 
 #[derive(Archive, Deserialize, Serialize, Debug)]
+#[rkyv(derive(Debug))]
 pub enum ProtocolS2C {
     Tcp {
         data: Vec<u8>,
@@ -32,6 +33,7 @@ pub enum ProtocolS2C {
         req: u64,
     },
 }
+
 #[derive(Archive, Deserialize, Serialize, Debug)]
 #[rkyv(derive(Debug))]
 pub enum ProtocolC2S {
@@ -64,17 +66,21 @@ pub enum ProtocolC2S {
     },
     Identify,
 }
+
 #[derive(Archive, Deserialize, Serialize, Debug)]
+#[rkyv(derive(Debug))]
 pub struct StreamS2C {
     pub cid: u128,
     pub msg: ProtocolS2C,
 }
+
 #[derive(Archive, Deserialize, Serialize, Debug)]
 #[rkyv(derive(Debug))]
 pub struct StreamC2S {
     pub cid: u128,
     pub msg: ProtocolC2S,
 }
+
 #[derive(Archive, Deserialize, Serialize, Debug)]
 pub struct DatagramMessage {
     pub cid: u128,

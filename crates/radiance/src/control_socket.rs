@@ -1,5 +1,6 @@
 use partially::Partial;
-use serde::{Deserialize, Serialize};
+use radiance_types::{ControlCommand, ControlResponse};
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -7,31 +8,9 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::RwLock;
 use tracing::{error, info};
 
-use crate::config::{Config, FullConfig, HostConfig, PartialHostConfig};
+use radiance_types::{HostConfig, PartialHostConfig};
+use crate::config::{Config, FullConfig, };
 use crate::environment::CONFIG_FILE;
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "command", rename_all = "snake_case")]
-pub enum ControlCommand {
-    AddHost { id: String, host: HostConfig },
-    UpdateHost { id: String, host: PartialHostConfig },
-    RemoveHost { id: String },
-    ListHosts,
-    Reload,
-    GetHost { id: String },
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum ControlResponse {
-    Success {
-        message: String,
-        data: Option<serde_json::Value>,
-    },
-    Error {
-        message: String,
-    },
-}
 
 pub type SharedConfig = Arc<RwLock<FullConfig>>;
 
@@ -57,11 +36,7 @@ impl ControlSocket {
         let listener = UnixListener::bind(&self.socket_path)?;
         info!("Control socket listening on: {}", self.socket_path);
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&self.socket_path, std::fs::Permissions::from_mode(0o660))?;
-        }
+        std::fs::set_permissions(&self.socket_path, std::fs::Permissions::from_mode(0o660))?;
 
         loop {
             match listener.accept().await {
