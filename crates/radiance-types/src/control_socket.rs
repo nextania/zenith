@@ -11,8 +11,8 @@ pub enum ControlCommand {
     ListHosts,
     Reload,
     GetHost { id: String },
-    // SetHttpChallenge { domain: String, token: String, response: String },
-    // ClearHttpChallenge { domain: String, token: String },
+    SetHttpChallenge { domain: String, token: String, thumbprint: String },
+    ClearHttpChallenge { domain: String, token: String },
 }
 
 #[derive(Debug, Serialize, Deserialize)]

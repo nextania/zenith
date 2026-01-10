@@ -4,6 +4,7 @@ mod certificate_manager;
 mod cloudflare;
 mod config;
 mod dns_provider;
+pub mod control_socket;
 
 use anyhow::{Result, anyhow};
 use certificate_manager::CertificateManager;
@@ -43,14 +44,13 @@ async fn main() -> Result<()> {
         .map(|c| {
             let dns_provider = dns_providers
                 .get(&c.dns_provider)
-                .ok_or_else(|| {
-                    anyhow!(
-                        "DNS provider '{}' not configured for certificate '{}'",
-                        c.dns_provider,
-                        c.name
-                    )
-                })?
-                .clone();
+                .cloned();
+            if dns_provider.is_none() && c.control_socket.is_none() {
+                return Err(anyhow!(
+                    "Certificate '{}' requires a challenge provider, but none was found",
+                    c.name
+                ));
+            }
             CertificateManager::new(c.clone(), dns_provider)
         })
         .collect::<Result<Vec<_>>>()?;

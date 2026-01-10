@@ -17,6 +17,7 @@ pub struct CertificateConfig {
     pub dns_provider: String,
     pub account_email: String,
     pub output_dir: String,
+    pub control_socket: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

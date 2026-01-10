@@ -1,4 +1,4 @@
-use crate::acme_provider::AcmeProviderType;
+use crate::{acme_provider::AcmeProviderType, control_socket::ControlSocket};
 use crate::dns_provider::DnsProvider;
 use anyhow::{Result, anyhow};
 use instant_acme::{Account, AccountCredentials, ChallengeType, Identifier, NewOrder, OrderStatus};
@@ -11,9 +11,10 @@ use tracing::{debug, info};
 use x509_parser::pem::parse_x509_pem;
 
 pub struct AcmeService {
-    dns_provider: Arc<dyn DnsProvider>,
     account_email: String,
     acme_provider: AcmeProviderType,
+    dns_provider: Option<Arc<dyn DnsProvider>>,
+    control_socket: Option<ControlSocket>,
 }
 
 pub struct CertificateResult {
@@ -24,14 +25,16 @@ pub struct CertificateResult {
 
 impl AcmeService {
     pub fn new(
-        dns_provider: Arc<dyn DnsProvider>,
         account_email: String,
         acme_provider: AcmeProviderType,
+        dns_provider: Option<Arc<dyn DnsProvider>>,
+        control_socket: Option<ControlSocket>,
     ) -> Self {
         Self {
-            dns_provider,
             account_email,
             acme_provider,
+            dns_provider,
+            control_socket,
         }
     }
 
@@ -106,56 +109,132 @@ impl AcmeService {
                 .challenges
                 .iter()
                 .find(|c| c.r#type == ChallengeType::Dns01)
-                .ok_or_else(|| anyhow!("No DNS-01 challenge found"))?;
-
-            info!("Processing DNS-01 challenge");
-            let domain = match &authz.identifier {
-                Identifier::Dns(d) => d,
-            };
-            let base_domain = self.get_base_domain(domain);
-            let record_name = format!("_acme-challenge.{}", domain);
-            let key_authorization = order.key_authorization(challenge).dns_value();
-            let record_id = self
-                .dns_provider
-                .create_txt_record(&base_domain, &record_name, &key_authorization)
-                .await?;
-
-            info!("Validating challenge");
-            order.set_challenge_ready(&challenge.url).await?;
-            let mut attempts = 0;
-            loop {
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                order.refresh().await?;
-                let state = order.state();
-                debug!("Order status: {:?}", state.status);
-                match state.status {
-                    OrderStatus::Ready | OrderStatus::Valid => {
-                        info!("Challenge validated successfully");
-                        break;
-                    }
-                    OrderStatus::Invalid => {
-                        self.dns_provider
-                            .delete_txt_record(&base_domain, &record_id)
-                            .await
-                            .ok();
-                        return Err(anyhow!("Challenge validation failed"));
-                    }
-                    OrderStatus::Pending | OrderStatus::Processing => {
-                        attempts += 1;
-                        if attempts > 30 {
-                            self.dns_provider
+                .or_else(|| {
+                    authz.challenges
+                        .iter()
+                        .find(|c| c.r#type == ChallengeType::Http01)
+                });
+            if let Some(challenge) = challenge {
+                match challenge.r#type {
+                    ChallengeType::Dns01 => {
+                        if let Some(dns_provider) = &self.dns_provider {
+                            info!("Processing DNS-01 challenge");
+                            let domain = match &authz.identifier {
+                                Identifier::Dns(d) => d,
+                            };
+                            let base_domain = self.get_base_domain(domain);
+                            let record_name = format!("_acme-challenge.{}", domain);
+                            let key_authorization = order.key_authorization(challenge).dns_value();
+                            let record_id = dns_provider
+                                .create_txt_record(&base_domain, &record_name, &key_authorization)
+                                .await?;
+                
+                            info!("Validating challenge");
+                            order.set_challenge_ready(&challenge.url).await?;
+                            let mut attempts = 0;
+                            loop {
+                                tokio::time::sleep(Duration::from_secs(5)).await;
+                                order.refresh().await?;
+                                let state = order.state();
+                                debug!("Order status: {:?}", state.status);
+                                match state.status {
+                                    OrderStatus::Ready | OrderStatus::Valid => {
+                                        info!("Challenge validated successfully");
+                                        break;
+                                    }
+                                    OrderStatus::Invalid => {
+                                        dns_provider
+                                            .delete_txt_record(&base_domain, &record_id)
+                                            .await
+                                            .ok();
+                                        return Err(anyhow!("Challenge validation failed"));
+                                    }
+                                    OrderStatus::Pending | OrderStatus::Processing => {
+                                        attempts += 1;
+                                        if attempts > 30 {
+                                            dns_provider
+                                                .delete_txt_record(&base_domain, &record_id)
+                                                .await
+                                                .ok();
+                                            return Err(anyhow!("Challenge validation timeout"));
+                                            // TODO: When timing out, retry sooner than 24 hours
+                                        }
+                                    }
+                                }
+                            }
+                            dns_provider
                                 .delete_txt_record(&base_domain, &record_id)
-                                .await
-                                .ok();
-                            return Err(anyhow!("Challenge validation timeout"));
-                            // TODO: When timing out, retry sooner than 24 hours
+                                .await?;
+                        } else {
+                            return Err(anyhow!(
+                                "No DNS provider configured for DNS-01 challenge"
+                            ));
                         }
                     }
+                    ChallengeType::Http01 => {
+                        info!("Processing HTTP-01 challenge");
+                        if let Some(control_socket) = &self.control_socket {
+                            let domain = match &authz.identifier {
+                                Identifier::Dns(d) => d,
+                            };
+                            let token = &challenge.token;
+                            let key_authorization = order.key_authorization(challenge);
+                            control_socket
+                                .set_http_challenge(domain, token, &key_authorization.as_str())
+                                .await?;
+                
+                            info!("Validating challenge");
+                            order.set_challenge_ready(&challenge.url).await?;
+                            let mut attempts = 0;
+                            loop {
+                                tokio::time::sleep(Duration::from_secs(5)).await;
+                                order.refresh().await?;
+                                let state = order.state();
+                                debug!("Order status: {:?}", state.status);
+                                match state.status {
+                                    OrderStatus::Ready | OrderStatus::Valid => {
+                                        info!("Challenge validated successfully");
+                                        break;
+                                    }
+                                    OrderStatus::Invalid => {
+                                        control_socket
+                                            .clear_http_challenge(domain, token)
+                                            .await
+                                            .ok();
+                                        return Err(anyhow!("Challenge validation failed"));
+                                    }
+                                    OrderStatus::Pending | OrderStatus::Processing => {
+                                        attempts += 1;
+                                        if attempts > 30 {
+                                            control_socket
+                                                .clear_http_challenge(domain, token)
+                                                .await
+                                                .ok();
+                                            return Err(anyhow!("Challenge validation timeout"));
+                                        }
+                                    }
+                                }
+                            }
+                            control_socket
+                                .clear_http_challenge(domain, token)
+                                .await?;
+                        } else {
+                            return Err(anyhow!(
+                                "No control socket configured for HTTP-01 challenge"
+                            ));
+                        }
+                    }
+                    _ => {
+                        unreachable!()
+                    }
                 }
+            } else {
+                return Err(anyhow!(
+                    "No supported challenge found for domain {:?}",
+                    authz.identifier
+                ));
             }
-            self.dns_provider
-                .delete_txt_record(&base_domain, &record_id)
-                .await?;
+
         }
 
         info!("Generating certificate private key");

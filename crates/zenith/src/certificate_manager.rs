@@ -1,6 +1,7 @@
 use crate::acme::AcmeService;
 use crate::acme_provider::AcmeProviderType;
 use crate::config::CertificateConfig;
+use crate::control_socket::ControlSocket;
 use crate::dns_provider::DnsProvider;
 use anyhow::Result;
 use std::path::PathBuf;
@@ -11,17 +12,20 @@ use tracing::info;
 pub struct CertificateManager {
     config: CertificateConfig,
     acme_service: AcmeService,
+    socket: Option<ControlSocket>,
 }
 
 impl CertificateManager {
-    pub fn new(config: CertificateConfig, dns_provider: Arc<dyn DnsProvider>) -> Result<Self> {
+    pub fn new(config: CertificateConfig, dns_provider: Option<Arc<dyn DnsProvider>>) -> Result<Self> {
         let acme_provider = AcmeProviderType::from_string(&config.acme_provider)?;
+        let socket = config.control_socket.clone().map(|s| ControlSocket::new(s));
         let acme_service =
-            AcmeService::new(dns_provider, config.account_email.clone(), acme_provider);
+            AcmeService::new(config.account_email.clone(), acme_provider, dns_provider, socket.clone());
 
         Ok(Self {
             config,
             acme_service,
+            socket,
         })
     }
 
@@ -83,6 +87,16 @@ impl CertificateManager {
                 info!(
                     "Certificate '{}': Full chain saved to: {:?}",
                     self.config.name, paths.fullchain
+                );
+            }
+
+            if let Some(hot_reload_socket) = &self.socket {
+                hot_reload_socket
+                    .send_reload_command()
+                    .await?;
+                info!(
+                    "Certificate '{}': Sent reload command to socket: {:?}",
+                    self.config.name, hot_reload_socket
                 );
             }
 
