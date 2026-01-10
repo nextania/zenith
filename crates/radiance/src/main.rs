@@ -4,6 +4,7 @@ pub mod environment;
 pub mod outpost;
 mod proxy;
 pub mod vault;
+pub mod virtual_connector;
 
 use control_socket::ControlSocket;
 use pingora::{listeners::tls::TlsSettings, prelude::*, tls::ResolvesServerCert};
